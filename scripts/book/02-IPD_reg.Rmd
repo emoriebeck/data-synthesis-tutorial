@@ -1,0 +1,1428 @@
+---
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+# Method 1: Pooled One Stage Models without Study-Specific Effects {#runmodels}
+
+## Step 1: Combine Data  
+
+```{r ipd reg load combined data}
+loadRData <- function(fileName, type){
+#loads an RData file, and returns it
+    path <- sprintf("%s/data/clean/%s_cleaned.RData", local_path, fileName)
+    load(path)
+    get(ls()[grepl(type, ls())])
+}
+
+ipd_reg_data <- tibble(
+  study = studies[!studies %in% c("CNLSY", "SLS")]
+  , data = map(str_to_lower(study), ~loadRData(., "combined"))
+  ) %>% mutate(
+    data = map(data, ~(.) %>% 
+                 ungroup() %>% 
+                 mutate(SID = as.character(SID)))
+    , study = mapvalues(study, studies, studies_long)
+  ) %>%
+  unnest(data) %>%
+  mutate(age = ifelse(is.na(age), p_year - yearBrth, age))
+
+ipd_reg_data
+```
+
+
+### Study-Level Moderators  
+
+First, we need to bring in a few study-level moderators from Table 4, which includes information about the continent and country of origin, and the type of personality scale. Then we'll join those data with cleaned data from each study in order to calculate the average age at baseline, the average baseline year, and the average interval between personality and cogntiive measurements. Because these vary within studies across personality traits and outcomes, we calculate baseline age, year, and prediction interval for all combinations of these separately.  
+
+```{r ipd reg moder harmonization}
+ipd_reg_data <- sprintf("%s/codebooks/crystallized_tables.xlsx", local_path) %>% 
+  read_xlsx(., sheet = "Table 4") %>%
+  select(-Category, -Construct, -category) %>%
+  pivot_longer(cols = c("BASE-I":"SATSA")
+               , names_to = "study"
+               , values_to = "value") %>%
+  pivot_wider(names_from = "name"
+              , values_from = "value") %>%
+  mutate(continent = relevel(factor(continent), ref = "North America")
+         , country = relevel(factor(country), ref = "United States")
+         , scale = relevel(factor(scale), ref = "NEO-FFI")) %>%
+  # mutate(p_year = as.numeric(p_year)) %>%
+  right_join(ipd_reg_data) %>%
+  group_by(study, Trait, Outcome) %>%
+  mutate(baseAge = mean(age, na.rm = T) - 60, # center at age 60
+         predInt = mean(o_year - p_year) - 5, # center at 5 years
+         baseYear = ifelse(study %in% c("MARS", "MAP", "ROS"), mean(p_year), mean(p_year) - 2000)) %>% # center at 2000
+  ungroup()
+
+ipd_reg_data
+```
+
+### Harmonize Data  
+
+Next, we need to harmonize the data across studies. As we preregistered, continuous variables (personality, cognition, and self-rated health) will be calclulated as percentages of maximum possible separately for each study, Trait and outcome. Unlike standardization procedures, that have a mean of zero and unit variance and can be misleading when data are skewed, POMP does not rescale sample variance based on the observed data, which overly relies on deviations from the mean. Instead, POMP relies on the ratio between the difference between a score and the minimum and the maximum and minimum, or  
+
+POMP = $\frac{observed-minimum}{maximum-minimum}$*10.  
+
+In addition, gender will be dummy coded with male as the reference group, education will be centered at 12 years of education, and age will be grand mean-centered in each study (also for each trait and outcome combination).  
+
+```{r ipd reg harmonization}
+ipd_reg_data <- ipd_reg_data %>%
+  group_by(study, Trait, Outcome) %>%
+  mutate_at(vars(p_value, o_value), 
+        ~((. - min(., na.rm = T))/(max(., na.rm = T) - min(., na.rm = T))*10)) %>%
+  mutate(gender = factor(gender, levels = c(0,1), labels = c("Male", "Female")),
+         education = education - 12, # center at 12 years of education
+         age = age - mean(age, na.rm = T)) %>% # center 
+  ungroup()  %>%
+  select(-yearBrth)
+
+ipd_reg_data
+```
+
+### Save Data Files  
+Now, we'll save these data files into separate data files for each trait, outcome combination. This makes it easier to track each data set that will be used in subsequent analyses.  
+```{r ipd reg save data}
+save_fun <- function(d, trait, outcome){
+  save(d, file = sprintf("%s/data/one_stage/%s_%s.RData", local_path, trait, outcome))
+}
+
+ipd_reg_data %>%
+  group_by(Trait, Outcome) %>%
+  nest() %>%
+  ungroup() %>%
+  mutate(data = pmap(list(data, Trait, Outcome), save_fun))
+```
+
+
+## Step 2: Run Models and Extract Results  
+
+Once the data are prepped, we are ready to begin running models! For Method 1: Pooled One Stage Models without Study-Specific Effects, we will run two variants. The first is a simple linear regression that does not account for nesting / clustering in the data (specifically individuals within studies). The second is a simple linear regression with cluster-robust standard errors. The latter is of particular interest and benefit when study-specific effects are not of interest and one wants the best estimate of an aggregate, fixed effect.  
+
+### Method 1A: Linear Regression  
+
+Per our preregistration, the procedure for Method 1A is as follows: 
+
+Method 1a estimates only an overall effect of personality on cognition by including all data in a single simple regression model.  
+
+>**Procedure**:  
+1. Data across studies are cleaned and harmonized.  
+2. All data are combined into a single data set.  
+3. A single model tests the relationship between X & Y across all studies.  
+$Y_{ij}=b_0+b_1*predictor_{ij} + \epsilon_{ij}$,  
+where $b_1$ represents the overall effect of personality predicting the outcome.  
+
+>Models will be tested using the base `R` `lm()` function in `R`. Inferences will be made based on the 95\%  confidence intervals (CI).  
+
+The notable extension of this procedure is that we will also test other pregistered adjusted models and a set of moderators.  
+
+#### Model Function   
+The first thing we need is a function that will bring in the data, create a formula in the model based on input on the type (Frequentist or Bayesian), moderators (none, age, gender, SRhealth, and education), and combinations of covariates (single or fully adjusted based on age, gender, SRhealth, and education). Then we run the model, extract its fixed effect estimates, and save both for later. By saving the results, it will make it easier and faster for us to extract the necessary model results later while still retaining all information from the original model.  
+
+```{r ipd reg model fun, eval=F}
+ipd1a_mod_fun <- function(trait, outcome, type, mod, cov){
+  ## load the data
+  load(sprintf("%s/data/one_stage/%s_%s.RData", local_path, trait, outcome))
+  
+  ## model formula 
+  if (cov == "all") cv <- c("age", "gender", "education")
+  if (!cov %in% c("all", "none")) cv <- cov
+  rhs <- "p_value"
+  rhs <- if(cov != "none") c(rhs, cv) else rhs
+  if(mod != "none"){rhs <- c(rhs, paste("p_value", mod, sep = "*"))}
+  rhs <- paste(rhs, collapse = " + ")
+  f <- paste("o_value ~ ", rhs, collapse = "")
+  
+  ## compiled Bayesian model to speed up processing and avoid crashing
+  if(type == "Bayesian") load(sprintf("%s/results/1a_ipd_reg/bayes_sample_mod.RData", local_path))
+  
+  ## run the models & save
+  m <- if(type == "Frequentist"){do.call("lm", list(formula = f, data = quote(d)))} else {update(m, formula = f, nelocal_pathata = d, cores = 4)}
+  save(m, file = sprintf("%s/results/1a_ipd_reg/%s/models/%s_%s_%s_%s.RData", local_path, type, outcome, trait, mod, cov))
+  
+  ## extract model terms and confidence intervals & save
+  fx <- tidy(m, conf.int = T) %>%
+    select(term, estimate, conf.low, conf.high)
+  save(fx, file = sprintf("%s/results/1a_ipd_reg/%s/summary/%s_%s_%s_%s.RData", local_path, type, outcome, trait, mod, cov))
+  
+  ## get simple effects for moderator tests
+  if(mod != "none"){
+    pred.fx <- ipd1a_simpeff_fun(m, mod, type)
+    save(pred.fx, file = sprintf("%s/results/1a_ipd_reg/%s/predicted/%s_%s_%s_%s.RData", local_path, type, outcome, trait, mod, cov))
+  }
+  
+  ## clean up the local function environment
+  rm(list = c("d", "f", "rhs", "m", "fx", "cv"))
+  gc()
+}
+```
+
+#### Simple Effects Function  
+
+```{r ipd1a simple effects fun, eval=F}
+ipd1a_simpeff_fun <- function(m, moder, type){
+  d <- if(type == "Bayesian") m$data else m$model
+  d <- d %>% select(-o_value, -p_value)
+  cols <- colnames(d)
+  md_cl <- class(d[,moder])
+  if(any(sapply(d, class) == "numeric")){
+    msd <- d %>%
+      select_if(is.numeric) %>%
+      pivot_longer(everything()
+                   , names_to = "item"
+                   , values_to = "value") %>%
+      group_by(item) %>%
+      summarize_at(vars(value), lst(mean, sd)) %>%
+      ungroup()
+  }
+  if(any(sapply(d, class) == "factor")){
+    fct_lev <- d %>% 
+      select_if(is.factor) %>%
+      summarize_all(~list(unique(.)))
+  }
+  d <- d %>% select(-one_of(moder))
+  md_levs <- if(md_cl == "numeric"){
+    if(moder %in% c("age", "baseAge", "baseYear")) {
+      c(-10, 0, 10)
+      } else if (moder %in% c("predInt", "education")) {
+      c(-5, 0, 5) 
+      } else {
+        with(msd, c(mean[item == moder] - sd[item == moder], mean[item == moder], mean[item == moder] + sd[item == moder]))
+      }
+  } else { 
+    unique(fct_lev[,moder][[1]])
+  }
+  
+  mod_frame <- expand.grid(
+    p_value = seq(0,10,.5)
+    , modvalue = md_levs
+    , stringsAsFactors = F
+    ) %>% setNames(c("p_value", moder))
+  
+  if(ncol(d) > 0){
+    if(any(sapply(d, class) == "numeric")){
+      mod_frame <- tibble(mod_frame, d %>% select_if(is.numeric) %>% summarize_all(mean))
+    } 
+    if(any(sapply(d, class) == "factor")){
+      mod_frame <- tibble(mod_frame, d %>% select_if(is.factor) %>% summarize_all(~levels(.)[1]))
+    }
+  }
+  
+  pred.fx <- if(type == "Bayesian"){
+    bind_cols(
+      mod_frame, 
+      fitted(m, newdata = mod_frame) %>% data.frame
+    ) %>%
+      select(one_of(colnames(m$data)), pred = Estimate, lower = Q2.5, upper = Q97.5)
+  } else {
+    bind_cols(
+      mod_frame, 
+      predict(m, newdata = mod_frame, interval = "confidence") %>% data.frame 
+    ) %>%
+      select(one_of(colnames(m$model)), pred = fit, lower = lwr, upper = upr)
+  }
+  
+  rm(list = c("m", "mod_frame", "d", "md_levs"))
+  gc()
+  return(pred.fx)
+}
+```
+
+#### Run Models and Summaries  
+
+The code below generates all possible preregistrered combinations of traits, outcomes, types, moderators, and covariates. Then these combinations are fed serially to the model function written previously, which will run and save the results.  
+
+```{r, eval=F}
+load(sprintf("%s/data/one_stage/E_crystallized.RData", local_path))
+
+# clean data & keep only needed columns and a subset of the used variables
+d <- d %>%
+  group_by(study) %>%
+  nest() %>%
+  ungroup() %>%
+  mutate(data = map(data, ~(.) %>% filter(row_number() %in% sample(1:nrow(.), 100, replace = F)))) %>%
+  unnest(data) 
+
+# set priors & model specifications 
+Prior <-  c(set_prior("student_t(3, 0, 2)", class = "b"),
+            set_prior("student_t(3, 0, 5)", class = "Intercept"))
+Iter <- 30; Warmup <- 21; treedepth <- 20
+f <- bf(o_value ~ p_value + age + gender + education)
+m <- brm(formula = f
+            , data = d
+            , prior = Prior
+            , iter = Iter
+            , warmup = Warmup
+            , cores = 4)
+save(m, file = sprintf("%s/results/1a_ipd_reg/bayes_sample_mod.RData", local_path))
+rm(list = c("d", "Prior", "Iter", "Warmup", "treedepth", "f", "m"))
+```
+
+
+```{r ipd reg run models, eval=F}
+plan(multisession(workers = 10L))
+nested_ipd1a_reg <- 
+  ## moderator combinations
+  crossing(
+    Trait = traits$short_name
+    , Outcome = outcomes$short_name
+    , type = c("Frequentist", "Bayesian")
+    , Moderator = c("age", "gender", "education")
+    , Covariate = c("none", "all")
+) %>%
+  full_join(
+    # undmoderator combinations
+    crossing(
+      Trait = traits$short_name
+      , Outcome = outcomes$short_name
+      , type = c("Frequentist", "Bayesian")
+      , Moderator = c("none", stdyModers$short_name)
+      , Covariate = c("none", "age", "gender", "education", "all")
+      )
+) %>%
+  mutate(run = 
+           # pmap(list(Trait, Outcome, type, Moderator, Covariate)
+           future_pmap(list(Trait, Outcome, type, Moderator, Covariate)
+                , possibly(ipd1a_mod_fun, "uh-oh")
+                , .progress = T
+             , .options = furrr_options(
+                                    globals = c("ipd1a_mod_fun"
+                                                , "ipd1a_simpeff_fun"
+                                                , "read_path"
+                                                , "local_path"
+                                                , "res_path"
+                                                , "codebook"
+                                                , "covars"
+                                                , "moders"
+                                                , "outcomes"
+                                                , "studies"
+                                                , "stdyModers"
+                                                , "traits"
+                                                , "data_path")
+                                  , packages = c("lme4"
+                                                 , "broom"
+                                                 , "psych"
+                                                 , "knitr"
+                                                 , "broom.mixed"
+                                                 , "brms"
+                                                 #, "tidybayes"
+                                                 #, "bootpredictlme4"
+                                                 , "rstan"
+                                                 , "estimatr"
+                                                 #, "merTools"
+                                                 , "plyr"
+                                                 , "tidyverse"))
+             )
+         )
+closeAllConnections()
+```
+
+#### Compile Results  
+Once all the models are run, we are ready to compile all their results. By saving the fixed effects results previously, we are able to simply load those results and ignore the models. However, because we also saved the models, we can also recall and extract information from them if and when needed.  
+
+```{r}
+loadRData <- function(fileName, type, obj, folder){
+#loads an RData file, and returns it
+    path <- sprintf("%s/results/1a_ipd_reg/%s/%s/%s", res_path, type, folder, fileName)
+    load(url(path))
+    get(ls()[grepl(obj, ls())])
+}
+
+## load in "fixed" effects
+## first get file names
+nested_ipd1a_reg <- tibble(type = c("Frequentist", "Bayesian")) %>%
+  mutate(file = map(type, ~list.files(sprintf("%s/results/1a_ipd_reg/%s/summary", local_path, .)))) %>%
+  unnest(file) %>%
+  separate(file, c("Outcome", "Trait", "Moderator", "Covariate"), sep = "_", remove = F) %>% 
+  ## read in the files
+  mutate(Covariate = str_remove(Covariate, ".RData"),
+         fx = map2(file, type, ~loadRData(.x, .y, "fx", "summary"))) %>%
+  select(-file) 
+nested_ipd1a_reg
+```
+
+As can be seen above, the resulting data frame is nested, but it can be easily unnested using the unnest() function.
+
+```{r}
+nested_ipd1a_reg %>%
+  unnest(fx)
+```
+
+##### Tables  
+
+###### Fixed Effects  
+Next, we want to format the study results in APA table format. In this case, we are interested in the fixed effects of personality predicting cognitive ability when there were no moderators, and the personality x moderator interaction when there was a moderator.  
+
+```{r ipd1a table formatting}
+## format results 
+ipd1a_reg_tab <- nested_ipd1a_reg %>%
+  unnest(fx) %>%
+  # keep key terms 
+  filter((Moderator == "none" & term == "p_value") |
+         (Moderator != "none" & grepl("p_value:", term))) %>%
+  # mark significance and prettify trait, outcome, and covariate names
+  mutate(sig = ifelse(sign(conf.low) == sign(conf.high), "sig", "ns"),
+         Trait = factor(Trait, traits$short_name),
+         Outcome = factor(Outcome, outcomes$short_name, outcomes$long_name),
+         Moderator = factor(Moderator, c(moders$short_name, stdyModers$short_name), c(moders$long_name, stdyModers$long_name)),
+         Covariate = ifelse(Moderator != "None" & Covariate == "None", Moderator, Covariate),
+         Covariate = factor(Covariate, moders$short_name, str_wrap(moders$long_name, 15)),
+         term = str_remove_all(term, "p_value:"),
+         term = mapvalues(term, c("scaleBFIMS", "scaleIPIPNEO", "scaleTDAM40", "countryTheNetherlands")
+                          , c("scaleBFI-S", "scaleIPIP NEO", "scaleTDA-40", "countryThe Netherlands")),
+         term2 = factor(term, c(moders$short_term, stdyModers$short_term),
+                       c(moders$long_term, stdyModers$long_term))) %>%
+  # format values as text, combine estimates and CI's, bold significance
+  mutate_at(vars(estimate, conf.low, conf.high), 
+            ~ifelse(abs(.) < .01, sprintf("%.3f", .), sprintf("%.2f", .))) %>%
+  mutate(est = sprintf("%s<br>[%s, %s]", estimate, conf.low, conf.high),
+         est = ifelse(sig == "sig", sprintf("<strong>%s</strong>", est), est)) %>%
+  # mutate(est = sprintf("%s [%s, %s]", estimate, conf.low, conf.high),
+  # est = ifelse(sig == "sig", sprintf("\\textbf{%s}", est), est)) %>%
+  # final reshaping, remove extra columns, arrange values, and change to wide format
+  select(-estimate, -conf.low, -conf.high, -sig, -term) %>%
+  arrange(type, Outcome, Trait, Moderator, Covariate) %>%
+  pivot_wider(names_from = "Trait", values_from = "est") 
+ipd1a_reg_tab
+```
+
+Now that we've formatted the values, we can group by moderators and save results as separate tables. Even though additional information could be included given that we have one outcome, we'll stick with this split because it will make it easier for those using this tutorial who multiple traits, outcomes, covariates, and moderators.  
+
+```{r ipd1a table saving}
+## table function 
+ipd1a_tab_fun <- function(d, type, moder){
+  # long outcome name
+  md <- mapvalues(moder, c(moders$long_name, stdyModers$long_name), c(moders$short_name, stdyModers$short_name), warn_missing = F)
+  # getting row numbers for later grouping
+  rs <- d %>% group_by(Outcome) %>% tally() %>% 
+    mutate(end = cumsum(n), start = lag(end) + 1, start = ifelse(is.na(start), 1, start))
+  # number and name of columns for span columns 
+  cs <- if(length(unique(d$term2)) > 1) c(2, rep(1,5)) else rep(1,6)
+  names(cs) <- c(" ", traits$long_name)
+  cln <- if(length(unique(d$term2)) == 1) c("Covariate", rep("\\textit{b} [CI]", 5)) else c(" ", "Term", rep("\\textit{b} [CI]", 5))
+  cln <- if(length(unique(d$term2)) == 1) c("Covariate", rep("<em>b</em> [CI]", 5)) else c(" ", "Term", rep("<em>b</em> [CI]", 5))
+  al <- if(length(unique(d$term2)) == 1) c("r", rep("c", 5)) else c("r", "r", rep("c", 5))
+  if(length(unique(d$term2)) == 1) {
+    d <- d %>% select(-term2); dubs <- F
+  } 
+  # caption 
+  cap <- if(md == "none") "1A Pooled Analysis of Individual Participant Data: Fixed Effect Personality-Crystallized Domain Associations" else sprintf("1A Pooled Analysis of Individual Participant Data: Fixed Effect %s Moderation of Personality-Crystallized Domain Associations", md)
+  # kable the table
+  tab <- d %>%
+    select(-Outcome) %>%
+    kable(., "html"
+    # kable(., "latex"
+          , booktabs = T
+          , escape = F
+          , col.names = cln
+          , align = al
+          , caption = cap
+    ) %>% 
+    kable_classic(full_width = F, html_font = "Times New Roman") %>%
+    # kable_styling(full_width = F, font_size = 7) %>%
+    add_header_above(cs)
+  # for loop to add grouped sections 
+  for (i in 1:nrow(rs)){
+    tab <- tab %>% 
+      kableExtra::group_rows(rs$Moderator[i], rs$start[i], rs$end[i]) 
+  }
+  # save the resulting html table
+  save_kable(tab, file = sprintf("%s/results/1a_ipd_reg/%s/tables/overall/%s.html"
+                                 , local_path, type, md))
+  return(tab) # return the html table
+}
+
+ipd1a_fx_tab <- ipd1a_reg_tab %>%
+  group_by(type, Moderator) %>%
+  nest() %>%
+  ungroup() %>%
+  mutate(tab = pmap(list(data, type, Moderator), ipd1a_tab_fun))
+ipd1a_reg_tab
+
+## Frequentist, no moderator
+(ipd1a_fx_tab %>% filter(type == "Frequentist" & Moderator == "None"))$tab[[1]]
+
+## bayesian
+(ipd1a_fx_tab %>% filter(type == "Bayesian" & Moderator == "None"))$tab[[1]]
+```
+
+```{r ipd1a key term tab}
+ipd1a_tab_fun <- function(d, type, cov){
+  # long outcome name
+  covar <- mapvalues(cov, covars$long_name, covars$short_name, warn_missing = F)
+  # getting row numbers for later grouping
+  rs <- d %>% group_by(Moderator) %>% tally() %>% 
+    mutate(end = cumsum(n), start = lag(end) + 1, start = ifelse(is.na(start), 1, start))
+  # number and name of columns for span columns 
+  cs <- rep(1,6)
+  names(cs) <- c(" ", traits$long_name)
+  # cln <- if(length(unique(d$term2)) == 1) c("Covariate", rep("\\textit{b} [CI]", 5)) else c(" ", "Term", rep("\\textit{b} [CI]", 5))
+  cln <- c("Term", rep("<em>b</em> [CI]", 5))
+  al <- c("r", rep("c", 5))
+  # caption 
+  cv <- if (cov == "None") "Unadjusted" else cov
+  cap <- sprintf("1A Pooled Analysis of Individual Participant Data: Fixed Effect Estimates of %s Personality-Crystallized Domain Associations", cv)
+  # kable the table
+  tab <- d %>%
+    select(-Moderator) %>%
+    kable(., "html"
+    # kable(., "latex"
+          , booktabs = T
+          , escape = F
+          , col.names = cln
+          , align = al
+          , caption = cap
+    ) %>% 
+    kable_classic(full_width = F, html_font = "Times New Roman") %>%
+    # kable_styling(full_width = F, font_size = 7) %>%
+    add_header_above(cs)
+  # for loop to add grouped sections 
+  for (i in 1:nrow(rs)){
+    tab <- tab %>% 
+      kableExtra::group_rows(rs$Moderator[i], rs$start[i], rs$end[i]) 
+  }
+  # save the resulting html table
+  save_kable(tab, file = sprintf("%s/results/1a_ipd_reg/%s/tables/key terms/%s.html"
+                                 , local_path, type, covar))
+  return(tab) # return the html table
+}
+
+ipd1a_fx_tab2 <- ipd1a_reg_tab %>%
+  arrange(Outcome, Moderator, term2) %>%
+  filter(Covariate %in% c("None", "Fully Adjusted")) %>%
+  group_by(Outcome, type, Covariate) %>% 
+  nest() %>%
+  ungroup() %>%
+  mutate(tab = pmap(list(data, type, Covariate), ipd1a_tab_fun))
+
+## Frequentist, no moderator
+(ipd1a_fx_tab2 %>% filter(type == "Frequentist" & Covariate == "Fully Adjusted"))$tab[[1]]
+
+## bayesian
+(ipd1a_fx_tab2 %>% filter(type == "Bayesian" & Covariate == "Fully Adjusted"))$tab[[1]]
+
+# save(ipd1a_fx_tab, ipd1a_fx_tab2, ipd1a_res, file = sprintf("%s/manuscript/results/ipd1a_fx_tab.RData", local_path))
+```
+
+
+###### Study-Specific Effects  
+This header is here to simply emphasize that this method does not provide study-specific estimates, unlike Methods 2ab, 3, and 4.  
+
+###### Heterogeneity Estimates  
+This header is here to simply emphasize that this method does not provide heterogeneity estimates because it does not provide study-specific estimates, unlike Methods 2ab, 3, and 4.  
+
+###### All Model Terms  
+
+```{r ipd1a all model terms}
+ipd1a_mod_tab <- nested_ipd1a_reg %>%
+  unnest(fx) %>%
+  # keep key terms 
+  # mark significance and prettify trait, outcome, and covariate names
+  mutate(sig = ifelse(sign(conf.low) == sign(conf.high), "sig", "ns"),
+         Trait = factor(Trait, traits$short_name),
+         Outcome = factor(Outcome, outcomes$short_name, outcomes$long_name),
+         Moderator = factor(Moderator, c(moders$short_name, stdyModers$short_name), c(moders$long_name, stdyModers$long_name)),
+         Covariate = factor(Covariate, covars$short_name, str_wrap(covars$long_name, 15)),#ifelse(Moderator != "None" & Covariate == "none", Moderator, Covariate),
+         ) %>%
+  # format values as text, combine estimates and CI's, bold significance
+  mutate_at(vars(estimate, conf.low, conf.high), 
+            ~ifelse(abs(.) < .01, sprintf("%.3f", .), sprintf("%.2f", .))) %>%
+  mutate(est = sprintf("%s<br>[%s, %s]", estimate, conf.low, conf.high),
+         est = ifelse(sig == "sig", sprintf("<strong>%s</strong>", est), est)) %>%
+  # mutate(est = sprintf("%s [%s, %s]", estimate, conf.low, conf.high),
+  # est = ifelse(sig == "sig", sprintf("\\textbf{%s}", est), est)) %>%
+  # final reshaping, remove extra columns, arrange values, and change to wide format
+  select(-estimate, -conf.low, -conf.high, -sig) %>%
+  arrange(type, Outcome, Trait, Moderator, Covariate) %>%
+  pivot_wider(names_from = "Trait", values_from = "est") 
+
+ipd1a_mod_tab_fun <- function(d, type, out, moder, cov){
+  md <- mapvalues(moder, c(moders$long_name, stdyModers$long_name), c(moders$short_name, stdyModers$short_name), warn_missing = F)
+  o <- mapvalues(out, outcomes$long_name, outcomes$short_name, warn_missing = F)
+  cv <- mapvalues(cov, covars$long_name, covars$short_name, warn_missing = F)
+  cs <- rep(1,6)
+  names(cs) <- c(" ", traits$long_name)
+  # cln <- if(length(unique(d$term2)) == 1) c("Covariate", rep("\\textit{b} [CI]", 5)) else c(" ", "Term", rep("\\textit{b} [CI]", 5))
+  cln <- c("Term", rep("<em>b</em> [CI]", 5))
+  al <- c("r", rep("c", 5))
+  # caption 
+  cap <- if(md == "none") "1A Pooled Analysis of Individual Participant Data: All Model Estimates of Fixed Effect Personality-Crystallized Domain Associations" else sprintf("1A Pooled Analysis of Individual Participant Data: All Model Estimates of Fixed Effect %s Moderation of Personality-Crystallized Domain Associations", md)
+  
+  # kable the table
+  tab <- d %>%
+    arrange(term) %>%
+    kable(., "html"
+    # kable(., "latex"
+          , booktabs = T
+          , escape = F
+          , col.names = cln
+          , align = al
+          , caption = cap
+    ) %>% 
+    kable_classic(full_width = F, html_font = "Times New Roman") %>%
+    # kable_styling(full_width = F, font_size = 7) %>%
+    add_header_above(cs)
+  # save the resulting html table
+  save_kable(tab, file = sprintf("%s/results/1a_ipd_reg/%s/tables/all terms/%s-%s-%s.html"
+                                 , local_path, type, o, md, cv))
+  return(tab) # return the html table
+}
+
+ipd1a_mod_tab <- ipd1a_mod_tab %>%
+  group_by(type, Outcome, Moderator, Covariate) %>%
+  nest() %>%
+  ungroup() %>%
+  mutate(tab = pmap(list(data, type, Outcome, Moderator, Covariate), ipd1a_mod_tab_fun))
+```
+
+##### Figures  
+###### Overall Forest  
+
+```{r ipd1a overall forest, eval = F}
+ipd1a_fx_plot_fun <- function(df, mod, type, cov){
+  m <- mapvalues(mod, c(moders$short_name, stdyModers$short_name), c(moders$long_name, stdyModers$long_name), warn_missing = F)
+  cv <- mapvalues(cov, covars$short_name, covars$long_name, warn_missing = F)
+  dl <- round(max(abs(min(df$estimate)), abs(max(df$estimate))), 3)
+  # stds <- unique(df$study)
+  lim <- c(0-dl-(dl/2.5), 0+dl+(dl/2.5))
+  brk <- if(dl > .01) round(c(0-dl-(dl/5), 0, 0+dl+(dl/5)),2) else round(c(0-dl-(dl/5), 0, 0+dl+(dl/5)),3) 
+  # lim_high <- lim[2]*4
+  lab <- str_replace(brk, "^0.", ".")#str_remove(round(c(0-d-(d/5), 0, 0+d+(d/5)),2), "^0")
+  shapes <- c(15, 16, 17, 18)[1:length(unique(df$term))]
+  lt <- rep("solid", length(unique(df$term)))
+  titl <- if(mod == "none"){NULL} else {sprintf("%s Moderation of Personality-Outcome Associations", m)}
+  titl <- if(!cov %in% c("none", "all")) paste(cv, "Adjusted", titl, collapse = " ") else paste(cv, titl, collapse = " ")
+  leg <- if(length(unique(df$term)) > 1){"bottom"} else {"none"}
+  p <- df %>%
+    mutate(conf.low = ifelse(conf.low < lim[1], lim[1], conf.low),
+           conf.high = ifelse(conf.high > lim[2], lim[2], conf.high)) %>% 
+  ggplot(aes(x = Outcome, y = estimate)) +
+    scale_y_continuous(limits = lim, breaks = brk, labels = lab) + 
+    scale_size_manual(values = c(2, 1.5)) +
+    scale_shape_manual(values = shapes) +
+    scale_color_manual(values = c("blue", "black")) +
+    scale_linetype_manual(values = lt) +
+    geom_hline(aes(yintercept = 0), size = .5, linetype = "dashed") +
+    geom_errorbar(aes(ymin = conf.low, ymax = conf.high, linetype = term)
+                  , width = 0
+                  , position = position_dodge(width = .9)) + 
+    geom_point(aes(color = sig, size = sig, shape = term)
+                  , position = position_dodge(width = .9)) +
+    labs(x = NULL
+         , y = "Estimate (POMP)"
+         , title = titl
+         , subtitle = "Method 1A: Pooled Simple Linear Regression"
+         , term = "Term"
+         ) +
+    guides(color = "none", size = "none") +
+    facet_grid(~Trait, scales = "free_y", space = "free") +
+    coord_flip() +
+    theme_classic() +
+    theme(legend.position = leg,
+          plot.title = element_text(face = "bold", size = rel(1.2), hjust = .5),
+          plot.subtitle = element_text(hjust = .5),
+          panel.background = element_rect(color = "black", fill = "white"),
+          strip.background = element_blank(),
+          strip.text = element_text(face = "bold", color = "black", size = rel(1.4)),
+          axis.text = element_text(color = "black"),
+          axis.text.y = element_text(size = rel(1)))
+  ht <- length(unique(df$Outcome)); ht2 <- length(unique(df$term))
+  wdt <- length(unique(df$Trait))
+ggsave(file = sprintf("%s/results/1a_ipd_reg/%s/figures/overall forest/%s_%s_fixed.png", local_path, type, mod, cov), width = wdt*2, height = ht + ht2)
+# save(p, file = sprintf("%s/results/ipd1a_reg/%s/figures/overall forest/rdata/%s_fixed.RData", type, local_path, mod))
+rm(p)
+gc()
+return(T)
+}
+
+# x1 = 1, x2 = 1, y = 2
+# x1 = 1, x2 = 2, y = 3
+
+ipd1a_fp <- nested_ipd1a_reg %>%
+  unnest(fx) %>%
+    filter((Moderator == "none" & term == "p_value")|
+          (Moderator != "none" & grepl("p_value:", term))) %>%
+    mutate(sig = ifelse(sign(conf.low) == sign(conf.high), "sig", "ns"),
+           sig = factor(sig, levels = c("sig","ns")),
+           Trait = factor(Trait, levels = traits$short_name),
+           Outcome = factor(Outcome, levels = outcomes$short_name, labels = str_wrap(outcomes$long_name, 15)),
+           Outcome = forcats::fct_rev(Outcome))  %>%
+  group_by(type, Moderator, Covariate) %>%
+  nest() %>%
+  ungroup() %>%
+  mutate(pmap(list(data, Moderator, type, Covariate), ipd1a_fx_plot_fun))
+```
+
+###### Study-Specific Forest Plots  
+This header is here to simply emphasize that this method does not provide study-specific estimates, unlike Methods 2ab, 3, and 4.  
+
+###### Overall Simple Effects Plots  
+
+```{r ipd1a somple effects}
+loadRData <- function(fileName, type, obj, folder){
+#loads an RData file, and returns it
+    path <- sprintf("%s/results/1a_ipd_reg/%s/%s/%s", local_path, type, folder, fileName)
+    load(path)
+    get(ls()[grepl(obj, ls())])
+}
+
+## load in "fixed" effects
+## first get file names
+nested_ipd1a_simp <- tibble(type = c("Frequentist", "Bayesian")) %>%
+  mutate(file = map(type, ~list.files(sprintf("%s/results/1a_ipd_reg/%s/predicted", local_path, .)))) %>%
+  unnest(file) %>%
+  separate(file, c("Outcome", "Trait", "Moderator", "Covariate"), sep = "_", remove = F) %>% 
+  ## read in the files
+  mutate(Covariate = str_remove(Covariate, ".RData"),
+         pred = map2(file, type, ~loadRData(.x, .y, "pred.fx", "predicted"))) %>%
+  select(-file) 
+nested_ipd1a_simp
+```
+
+###### Study-Specific Simple Effects Plots  
+This header is here to simply emphasize that this method does not provide study-specific estimates, unlike Methods 2ab, 3, and 4.  
+
+```{r ipd1a simple effects plots}
+simp_eff_fun <- function(df, outcome, mod, type, cov){ 
+  print(paste(outcome, mod))
+  o <- mapvalues(outcome, outcomes$short_name, outcomes$long_name, warn_missing = F)
+  cv <- mapvalues(cov, covars$short_name, covars$long_name, warn_missing = F)
+  m <- mapvalues(mod, c(moders$short_name, stdyModers$short_name), c(moders$long_name, stdyModers$long_name), warn_missing = F)
+  d <- round(max(abs(min(df$pred)), abs(max(df$pred))), 3)
+  mini <- if(d > 2) .05 else 0-(d+(d/5))
+  maxi <- if(d > 2) 2.05 else 0+d+(d/5)
+  lim <- c(mini, maxi)
+  brk <- if(d > 2) c(0, 1, 2) else{round(c(0-d-(d/10), 0, 0+d+(d/10)),2)}
+  lab <- if(d > 2){c("0", "1", "2")} else{str_remove(c(round(0-d-(d/10),2), 0, round(0+d+(d/10),2)), "^0")}
+  titl <- if(mod == "none"){o} else {sprintf("%s: Personality x %s Simple Effects", o, m)}
+  # colnames(df)[colnames(df) == mod] <- "mod_value"
+  df <- df %>% unclass %>% data.frame
+  df$mod_value <- df[,mod]
+  df <- df %>% select(-all_of(mod)) %>% as_tibble
+  if(class(df$mod_value) == "factor"){df <- df %>% mutate(mod_fac = factor(mod_value))} 
+  else{df <- df %>%
+    group_by(Trait) %>%
+    mutate(mod_fac = factor(mod_value, levels = unique(mod_value), labels = c("-1 SD", "M", "+1 SD"))) %>%
+    ungroup()
+  }
+  lt <- c("dotted", "solid", "dashed", "dotdash", "longdash", "twodash")[1:length(unique(df$mod_fac))]
+  
+  df %>%
+    mutate(Trait = factor(Trait, levels = traits$short_name, labels = traits$long_name),
+           lower = ifelse(lower < 4, 4, lower),
+           upper = ifelse(upper > 10, 10, upper)) %>%
+    ggplot(aes(x = p_value
+               , y = pred
+               , group  = mod_fac))  +
+      scale_y_continuous(limits = c(4,10)
+                         , breaks = c(4, 6, 8, 10)
+                         , labels = c(4, 6, 8, 10)) +
+      scale_linetype_manual(values = lt) +
+      geom_ribbon(aes(ymin = lower
+                      , ymax = upper
+                      , fill = mod_fac)
+                  , alpha = .25) +
+      geom_line(aes(linetype = mod_fac)) +
+      labs(x = "Personality (POMP)"
+           , y = paste(o, "(POMP)")
+           , title = titl
+           , linetype = m
+           , fill = m
+           , subtitle = "Method 1A: Pooled Simple Linear Regression") +
+      facet_wrap(~Trait, nrow = 3) +
+      theme_classic() +
+      theme(legend.position = "bottom"
+            , plot.title = element_text(face = "bold", size = rel(1.2), hjust = .5)
+            , plot.subtitle = element_text(hjust = .5)
+            , strip.background = element_rect(fill = "black")
+            , strip.text = element_text(face = "bold", color = "white")
+            , axis.text = element_text(color = "black"))
+  ggsave(file = sprintf("%s/results/1a_ipd_reg/%s/figures/overall simple effects/%s_%s_%s.png", local_path, type, outcome, mod, cov), width = 6, height = 6)
+}
+
+ipd1a_se_plot <- nested_ipd1a_simp %>%
+  group_by(type, Outcome, Moderator, Covariate) %>%
+  nest() %>%
+  ungroup() %>%
+  mutate(data = map(data, ~(.) %>% unnest(pred)),
+         plot = pmap(list(data, Outcome, Moderator, type, Covariate), simp_eff_fun))
+```
+
+```{r}
+# Extraversion continent
+load("/Volumes/Emorie/projects/data synthesis/crystallized/results/1a_ipd_reg/Frequentist/models/crystallized_E_continent_all.RData")
+coef(m)
+cntrm <- c(
+  "p_value = 0" # North America
+  , "p_value + p_value:continentAustralia = 0" # Australia
+  , "p_value + p_value:continentEurope = 0" # Europe
+); names(cntrm) <- c("North America", "Australia", "Europe")
+(multcomp::glht(m, cntrm) %>% # multcomp hypothesis function
+      confint(., calpha = multcomp::univariate_calpha()))$confint %>%
+      data.frame() %>% 
+  data.frame() %>%
+  rownames_to_column("cntr") %>%
+  mutate(term = mapvalues(cntr, str_remove(cntrm, " = 0"), names(cntrm))) %>% 
+  select(-cntr) %>%
+  mutate(est = sprintf("b = %.2f, 95%% CI [%.2f, %.2f]", Estimate, lwr, upr))
+
+# Neuroticism continent
+load("/Volumes/Emorie/projects/data synthesis/crystallized/results/1a_ipd_reg/Frequentist/models/crystallized_N_continent_all.RData")
+coef(m)
+cntrm <- c(
+  "p_value = 0" # North America
+  , "p_value + p_value:continentAustralia = 0" # Australia
+  , "p_value + p_value:continentEurope = 0" # Europe
+); names(cntrm) <- c("North America", "Australia", "Europe")
+(multcomp::glht(m, cntrm) %>% # multcomp hypothesis function
+      confint(., calpha = multcomp::univariate_calpha()))$confint %>%
+      data.frame() %>% 
+  data.frame() %>%
+  rownames_to_column("cntr") %>%
+  mutate(term = mapvalues(cntr, str_remove(cntrm, " = 0"), names(cntrm))) %>% 
+  select(-cntr) %>%
+  mutate(est = sprintf("b = %.2f, 95%% CI [%.2f, %.2f]", Estimate, lwr, upr))
+
+# Neuroticism continent
+load("/Volumes/Emorie/projects/data synthesis/crystallized/results/1a_ipd_reg/Frequentist/models/crystallized_O_scale_all.RData")
+coef(m)
+cntrm <- rbind(
+  c(0,1,rep(0,12)) # NEO-FFI
+  , c(0,1,rep(0,8),1,rep(0,3)) # BFI-S
+  , c(0,1,rep(0,9),1,rep(0,2)) # Eysenck
+  , c(0,1,rep(0,10),1,0) # MIDI
+  , c(0,1,rep(0,11),1) # TDA-40
+); rownames(cntrm) <- c("NEO-FFI", "BFI-S", "Eysenck", "MIDI", "TDA-40")
+(multcomp::glht(m, cntrm) %>% # multcomp hypothesis function
+      confint(., calpha = multcomp::univariate_calpha()))$confint %>%
+      data.frame() %>% 
+  data.frame() %>%
+  rownames_to_column("cntr") %>%
+  mutate(term = rownames(cntrm)) %>% 
+  select(-cntr) %>%
+  mutate(est = sprintf("b = %.2f, 95%% CI [%.2f, %.2f]", Estimate, lwr, upr))
+```
+
+```{r}
+rm(list = ls()[grepl("ipd1a", ls())])
+```
+
+### Part 1B: Pooled Linear Regression with Cluster Robust Standard Errors  
+Per the preregistration of this study: 
+
+>Method 1b estimates only an overall effect of personality on cognition by including all data in a single  regression model, with cluster robust standard errors.  
+
+>**Procedure**:  
+1. Data across studies are cleaned and harmonized.  
+2. All data are combined into a single data set.  
+3. A single model tests the relationship between X & Y across all studies.  
+$Y_{ij}=b_0+b_1*predictor_{ij} + \epsilon_{ij}$, with study as a cluster,  
+where $b_1$ represents the overall effect of personality predicting the outcome.  
+
+>Models will be tested using the `lm_robust()` function from the `estimatr` package in `R`. Inferences will be made based on the 95\% confidence intervals (CI).  
+
+The notable extension of this procedure is that we will also test other pregistered adjusted models and a set of moderators.  
+
+#### Model Function  
+The first thing we need is a function that will bring in the data, create a formula in the model based on input on the type (Frequentist or Bayesian), moderators (none, age, gender, and education), and combinations of covariates (single or fully adjusted based on age, gender, and education). Then we run the model, which in this case uses the `lm_robust()` function from the `estimatr` pacakge, extract its fixed effect estimates, and save both for later. By saving the results, it will make it easier and faster for us to extract the necessary model results later while still retaining all information from the original model.  
+
+```{r ipd fixef model fun}
+ipd1b_mod_fun <- function(trait, outcome, type, mod, cov){
+  ## load the data
+  load(sprintf("%s/data/one_stage/%s_%s.RData", local_path, trait, outcome))
+  
+  ## model formula 
+  if (cov == "all") cv <- c("age", "gender", "education")
+  if (!cov %in% c("all", "none")) cv <- cov
+  rhs <- "p_value"
+  rhs <- if(cov != "none") c(rhs, cv) else rhs
+  if(mod != "none"){rhs <- c(rhs, paste("p_value", mod, sep = "*"))}
+  rhs <- paste(rhs, collapse = " + ")
+  f <- paste("o_value ~ ", rhs, collapse = "")
+  
+  ## compiled Bayesian model to speed up processing and avoid crashing
+  if(type == "Bayesian") load(sprintf("%s/results/1a_ipd_reg/bayes_sample_mod.RData", local_path))
+  
+  ## run the models & save
+  m <- if(type == "Frequentist"){lm_robust(formula(f), data = d, clusters = study, se_type = "CR0")} else {update(m, formula = f, newdata = d)}
+  save(m, file = sprintf("%s/results/1b_ipd_fixef/%s/models/%s_%s_%s_%s.RData"
+                         , local_path, type, outcome, trait, mod, cov))
+  
+  ## extract model terms and confidence intervals & save
+  fx <- tidy(m, conf.int = T) %>%
+    select(term, estimate, conf.low, conf.high)
+  save(fx, file = sprintf("%s/results/1b_ipd_fixef/%s/summary/%s_%s_%s_%s.RData"
+                          , local_path, type, outcome, trait, mod, cov))
+  
+   ## get simple effects for moderator tests
+  if(mod != "none"){
+    pred.fx <- ipd1b_simpeff_fun(m, mod, type, d)
+    save(pred.fx, file = sprintf("%s/results/1b_ipd_fixef/%s/predicted/%s_%s_%s_%s.RData", local_path, type, outcome, trait, mod, cov))
+  }
+  
+  ## clean up the local function environment
+  rm(list = c("d", "f", "rhs", "m", "fx"))
+  gc()
+}
+```
+
+#### Simple Effects Function  
+```{r}
+ipd1b_simpeff_fun <- function(m, moder, type, d){
+  d <- if(type == "Bayesian") m$data else d %>% select(o_value, one_of(rownames(attr(m$terms, "factors")))) %>% filter(complete.cases(.)) %>% data.frame()
+  d <- d %>% select(-o_value, -p_value)
+  cols <- colnames(d)
+  md_cl <- class(d[,moder])
+  if(any(sapply(d, class) == "numeric")){
+    msd <- d %>%
+      select_if(is.numeric) %>%
+      pivot_longer(everything()
+                   , names_to = "item"
+                   , values_to = "value") %>%
+      group_by(item) %>%
+      summarize_at(vars(value), lst(mean, sd), na.rm = T) %>%
+      ungroup()
+  }
+  if(any(sapply(d, class) == "factor")){
+    fct_lev <- d %>% 
+      select_if(is.factor) %>%
+      summarize_all(~list(unique(.)))
+  }
+  d <- d %>% select(-one_of(moder))
+  md_levs <- if(md_cl == "numeric"){
+    if(moder %in% c("age", "baseAge", "baseYear")) {
+      c(-10, 0, 10)
+      } else if (moder %in% c("predInt", "education")) {
+      c(-5, 0, 5) 
+      } else {
+        with(msd, c(mean[item == moder] - sd[item == moder], mean[item == moder], mean[item == moder] + sd[item == moder]))
+      }
+  } else { 
+    unique(fct_lev[,moder][[1]])
+  }
+  
+  mod_frame <- crossing(
+    p_value = seq(0,10,.5)
+    , modvalue = md_levs
+    ) %>% setNames(c("p_value", moder))
+  
+  if(ncol(d) > 0){
+    if(any(sapply(d, class) == "numeric")){
+      mod_frame <- tibble(mod_frame, d %>% select_if(is.numeric) %>% summarize_all(mean))
+    } 
+    if(any(sapply(d, class) == "factor")){
+      mod_frame <- tibble(mod_frame, d %>% select_if(is.factor) %>% summarize_all(~levels(.)[1]))
+    }
+  }
+  
+  pred.fx <- if(type == "Bayesian"){
+    bind_cols(
+      mod_frame, 
+      fitted(m, newdata = mod_frame) %>% data.frame
+    ) %>%
+      select(one_of(colnames(m$data)), pred = Estimate, lower = Q2.5, upper = Q97.5)
+  } else {
+    bind_cols(
+      mod_frame, 
+      predict(m, newdata = mod_frame, interval = "confidence")$fit %>% data.frame 
+    ) %>%
+      select(one_of(rownames(attr(m$terms, "factors"))), pred = fit, lower = lwr, upper = upr)
+  }
+  
+  rm(list = c("m", "mod_frame", "d", "md_levs"))
+  gc()
+  return(pred.fx)
+}
+```
+
+#### Run Models and Summaries  
+The code below generates all possible preregistrered combinations of traits, outcomes, types, moderators, and covariates. Then these combinations are fed serially to the model function written previously, which will run and save the results.  
+
+```{r ipd fixef run models}
+plan(multisession(workers = 12L))
+nested_ipd1b_fixef <- 
+  # moderator combinations 
+  crossing(
+    Trait = traits$short_name
+    , Outcome = outcomes$short_name
+    , type = c("Frequentist")
+    , Moderator = c("age", "gender", "education")
+    , Covariate = c("none", "all")
+  ) %>%
+  full_join(
+    # unmoderated combinations 
+    crossing(
+      Trait = traits$short_name
+      , Outcome = outcomes$short_name
+      , type = c("Frequentist")
+      , Moderator = c("none")
+      , Covariate = c("none", "age", "gender", "education", "all")
+      )
+) %>%
+  # filter(Trait == "N") %>%
+  mutate(run = future_pmap(
+    list(Trait, Outcome, type, Moderator, Covariate)
+    , ipd1b_mod_fun
+    , .progress = T
+    , .options = furrr_options(
+      globals = c("res_path", "local_path", "ipd1b_simpeff_fun", "traits", "studies", "outcomes", "covars", "moders")
+      , packages = c("plyr", "tidyverse", "broom.mixed", "broom", "estimatr")
+           )
+    ))
+closeAllConnections()
+
+# nested_ipd1b_fixef %>%
+#   # select(-done) %>%
+#   write.table(.
+#               , file = sprintf("%s/scripts/cluster/args/frequentist/ipd1b_frequentist.txt", local_path)
+              # , row.names = F)
+```
+
+<!-- ### DELETE LATER   -->
+<!-- ```{r} -->
+<!-- pred_fun <- function(file, type, outcome, trait, mod, cov){ -->
+<!--   if(mod != "none"){ -->
+<!--     load(sprintf("%s/data/one_stage/%s_%s.RData", local_path, trait, outcome)) -->
+<!--     load(sprintf("%s/results/1b_ipd_fixef/%s/models/%s_%s_%s_%s.RData", local_path, type, outcome, trait, mod, cov)) -->
+<!--     pred.fx <- ipd1b_simpeff_fun(m, mod, type, d) -->
+<!--     save(pred.fx, file = sprintf("%s/results/1b_ipd_fixef/%s/predicted/%s_%s_%s_%s.RData", local_path, type, outcome, trait, mod, cov)) -->
+<!--   } -->
+<!-- } -->
+
+<!-- tibble(type = c("Frequentist", "Bayesian")) %>% -->
+<!--   mutate(file = map(type, ~list.files(sprintf("%s/results/1b_ipd_fixef/%s/summary", local_path, .)))) %>% -->
+<!--   unnest(file) %>% -->
+<!--   separate(file, c("Outcome", "Trait", "Moderator", "Covariate"), sep = "_", remove = F) %>%  -->
+<!--   ## read in the files -->
+<!--   mutate(Covariate = str_remove(Covariate, ".RData"), -->
+<!--          pmap(list(file, type, Outcome, Trait, Moderator, Covariate), possibly(pred_fun, NA_real_))) -->
+<!-- ``` -->
+
+
+#### Compile Results  
+Once all the models are run, we are ready to compile all their results. By saving the fixed effects results previously, we are able to simply load those results and ignore the models. However, because we also saved the models, we can also recall and extract information from them if and when needed.  
+
+```{r}
+loadRData <- function(fileName, type, obj, folder){
+#loads an RData file, and returns it
+    path <- sprintf("%s/results/1b_ipd_fixef/%s/%s/%s", local_path, type, folder, fileName)
+    load(path)
+    get(ls()[grepl(obj, ls())])
+}
+
+## load in "fixed" effects
+## first get file names
+nested_ipd1b_fixef <- tibble(type = c("Frequentist", "Bayesian")) %>%
+  mutate(file = map(type, ~list.files(sprintf("%s/results/1b_ipd_fixef/%s/summary", local_path, .)))) %>%
+  unnest(file) %>%
+  separate(file, c("Outcome", "Trait", "Moderator", "Covariate"), sep = "_", remove = F) %>% 
+  ## read in the files
+  mutate(Covariate = str_remove(Covariate, ".RData"),
+         fx = map2(file, type, ~loadRData(.x, .y, "fx", "summary"))) %>%
+  select(-file) 
+```
+
+##### Tables  
+Next, we want to format the study results in APA table format. In this case, we are interested in the fixed effects of personality predicting cognitive ability when there were no moderators, and the personality x moderator interaction when there was a moderator.  
+
+###### Fixed Effects  
+```{r}
+## format results 
+ipd1b_fixef_tab <- nested_ipd1b_fixef %>%
+  unnest(fx) %>%
+  filter((Moderator == "none" & term == "p_value") |
+         (Moderator != "none" & grepl("p_value:", term))) %>%
+  mutate(sig = ifelse(sign(conf.low) == sign(conf.high), "sig", "ns"),
+         Trait = factor(Trait, traits$short_name),
+         Outcome = factor(Outcome, outcomes$short_name, outcomes$long_name),
+         Moderator = factor(Moderator, c(moders$short_name, stdyModers$short_name), c(moders$long_name, stdyModers$long_name)),
+         Covariate = ifelse(Moderator != "None" & Covariate == "None", Moderator, Covariate),
+         Covariate = factor(Covariate, moders$short_name, str_wrap(moders$long_name, 15)),
+         term = str_remove_all(term, "p_value:"),
+         term = mapvalues(term, c("scaleBFIMS", "scaleIPIPNEO", "scaleTDAM40", "countryTheNetherlands")
+                          , c("scaleBFI-S", "scaleIPIP NEO", "scaleTDA-40", "countryThe Netherlands")),
+         term2 = factor(term, c(moders$short_term, stdyModers$short_term),
+                       c(moders$long_term, stdyModers$long_term))) %>%
+  mutate_at(vars(estimate, conf.low, conf.high), 
+            ~ifelse(abs(.) < .001, sprintf("%.3f", .), sprintf("%.2f", .))) %>%
+  mutate(est = sprintf("%s<br>[%s, %s]", estimate, conf.low, conf.high),
+         est = ifelse(sig == "sig", sprintf("<strong>%s</strong>", est), est)) %>%
+  # mutate(est = sprintf("%s [%s, %s]", estimate, conf.low, conf.high),
+  # est = ifelse(sig == "sig", sprintf("\\textbf{%s}", est), est)) %>%
+  select(-estimate, -conf.low, -conf.high, -sig, -term) %>%
+  arrange(type, Outcome, Trait, Moderator, Covariate) %>%
+  pivot_wider(names_from = "Trait", values_from = "est") 
+ipd1b_fixef_tab
+
+ipd1b_res <- nested_ipd1b_fixef %>%
+  unnest(fx) %>%
+  # keep key terms 
+  filter((Moderator == "none" & term == "p_value") |
+         (Moderator != "none" & grepl("p_value:", term))) %>%
+  mutate(sig = ifelse(sign(conf.low) == sign(conf.high), "sig", "ns")) %>%
+  mutate_at(vars(estimate, conf.low, conf.high), 
+            ~ifelse(abs(.) < .01, sprintf("%.3f", .), sprintf("%.2f", .))) %>%
+  mutate(est = sprintf("\\textit{b} = %s, 95\\%% CI [%s, %s]", estimate, conf.low, conf.high)) 
+```
+
+Now that we've formatted the values, we can group by moderators and save results as separate tables. Even though additional information could be included given that we have one outcome, we'll stick with this split because it will make it easier for those using this tutorial who multiple traits, outcomes, covariates, and moderators.  
+
+```{r}
+## table function 
+ipd1b_tab_fun <- function(d, type, moder){
+  # long outcome name
+  md <- mapvalues(moder, c("None", moders$long_name, stdyModers$long_name), c("none", moders$short_name, stdyModers$short_name), warn_missing = F)
+  d <- d %>% arrange(Outcome, Covariate, term2)
+  # getting row numbers for later grouping
+  rs <- d %>% group_by(Outcome) %>% tally() %>% 
+    mutate(end = cumsum(n), start = lag(end) + 1, start = ifelse(is.na(start), 1, start))
+  cs <- if(length(unique(d$term2)) > 1) c(2, rep(1,5)) else rep(1,6)
+  names(cs) <- c(" ", paste0("<strong>", traits$long_name, "</strong>"))
+  # cln <- if(length(unique(d$term2)) == 1) c(" ", rep("\\textit{b} [CI]", 5)) else c(" ", "Term", rep("\\textit{b} [CI]", 5))
+  cln <- if(length(unique(d$term2)) == 1) c(" ", rep("<em>b</em> [CI]", 5)) else c(" ", "Term", rep("<em>b</em> [CI]", 5))
+  al <- if(length(unique(d$term2)) == 1) c("r", rep("c", 5)) else c("r", "r", rep("c", 5))
+  if(length(unique(d$term2)) == 1) {
+    d <- d %>% select(-term2); dubs <- F
+  }
+  cap <- if(md == "none") "1B Pooled Analysis of Individual Participant Data: Cluster Robust Fixed Effect Personality-Crystallized Domain Associations" else sprintf("1B Pooled Analysis of Individual Participant Data: Cluster Robust Fixed Effect %s Moderation of Personality-Crystallized Domain Associations", md)
+  tab <- d %>%
+    select(-Outcome) %>%
+    kable(., "html"
+    # kable(., "latex"
+          , booktabs = T
+          , escape = F
+          , col.names = cln
+          , align = al
+          , caption = cap
+    ) %>% 
+    kable_classic(full_width = F, html_font = "Times New Roman") %>%
+    # kable_styling(full_width = F, font_size = 7) %>%
+    collapse_rows(1, "top") %>%
+    add_header_above(cs, escape = F) 
+  for (i in nrow(rs)){
+    tab <- tab %>% 
+      kableExtra::group_rows(rs$Outcome[i], rs$start[i], rs$end[i]) 
+  }
+  save_kable(tab, file = sprintf("%s/results/1b_ipd_fixef/%s/tables/overall/%s.html"
+                                 , local_path, type, md))
+  return(tab)
+}
+
+ipd1b_fx_tab <- ipd1b_fixef_tab %>%
+  group_by(type, Moderator) %>%
+  nest() %>%
+  ungroup() %>%
+  mutate(tab = pmap(list(data, type, Moderator), ipd1b_tab_fun))
+ipd1b_fx_tab
+
+# save(ipd1b_fixef_tab, ipd1b_res, file = sprintf("%s/manuscript/results/ipd1b_fx_tab.RData", local_path))
+
+## Frequentist
+(ipd1b_fx_tab %>% filter(type == "Frequentist" & Moderator == "None"))$tab[[1]]
+
+## bayesian
+(ipd1b_fx_tab %>% filter(type == "Bayesian" & Moderator == "None"))$tab[[1]]
+```
+
+
+```{r}
+ipd1b_tab_fun <- function(d, type, cov){
+  # long outcome name
+  covar <- mapvalues(cov, covars$long_name, covars$short_name, warn_missing = F)
+  # getting row numbers for later grouping
+  rs <- d %>% group_by(Moderator) %>% tally() %>% 
+    mutate(end = cumsum(n), start = lag(end) + 1, start = ifelse(is.na(start), 1, start))
+  # number and name of columns for span columns 
+  cs <- rep(1,6)
+  names(cs) <- c(" ", traits$long_name)
+  # cln <- if(length(unique(d$term2)) == 1) c("Covariate", rep("\\textit{b} [CI]", 5)) else c(" ", "Term", rep("\\textit{b} [CI]", 5))
+  cln <- c("Term", rep("<em>b</em> [CI]", 5))
+  al <- c("r", rep("c", 5))
+  # caption 
+  cv <- if (cov == "None") "Unadjusted" else cov
+  cap <- sprintf("1B Pooled Analysis of Individual Participant Data with Cluster Corrected Standard Errors: Fixed Effect Estimates of %s Personality-Crystallized Domain Associations", cv)
+  # kable the table
+  tab <- d %>%
+    select(-Moderator) %>%
+    kable(., "html"
+    # kable(., "latex"
+          , booktabs = T
+          , escape = F
+          , col.names = cln
+          , align = al
+          , caption = cap
+    ) %>% 
+    kable_classic(full_width = F, html_font = "Times New Roman") %>%
+    # kable_styling(full_width = F, font_size = 7) %>%
+    add_header_above(cs)
+  # for loop to add grouped sections 
+  for (i in 1:nrow(rs)){
+    tab <- tab %>% 
+      kableExtra::group_rows(rs$Moderator[i], rs$start[i], rs$end[i]) 
+  }
+  # save the resulting html table
+  save_kable(tab, file = sprintf("%s/results/1b_ipd_fixef/%s/tables/key terms/%s.html"
+                                 , local_path, type, covar))
+  return(tab) # return the html table
+}
+
+ipd1b_fx_tab2 <- ipd1b_fixef_tab %>%
+  arrange(Moderator, term2) %>%
+  filter(Covariate %in% c("None", "Fully Adjusted")) %>%
+  group_by(Outcome, type, Covariate) %>% 
+  nest() %>%
+  ungroup() %>%
+  mutate(tab = pmap(list(data, type, Covariate), ipd1b_tab_fun))
+
+
+## Frequentist, no moderator
+(ipd1b_fx_tab2 %>% filter(type == "Frequentist" & Covariate == "Fully Adjusted"))$tab[[1]]
+
+## bayesian
+(ipd1b_fx_tab2 %>% filter(type == "Bayesian" & Covariate == "Fully Adjusted"))$tab[[1]]
+
+
+# save(ipd1a_fx_tab, ipd1a_fx_tab2, ipd1a_res, file = sprintf("%s/manuscript/results/ipd1b_fx_tab.RData", local_path))
+```
+
+###### Study-Specific Effects  
+This header is here to simply emphasize that this method does not provide study-specific estimates, unlike Methods 2ab, 3, and 4.  
+
+###### Heterogeneity Estimates  
+This header is here to simply emphasize that this method does not provide heterogeneity estimates because it does not provide study-specific estimates, unlike Methods 2ab, 3, and 4.  
+
+###### All Model Terms  
+```{r}
+ipd1b_mod_tab <- nested_ipd1b_fixef %>%
+  unnest(fx) %>%
+  # keep key terms 
+  # mark significance and prettify trait, outcome, and covariate names
+  mutate(sig = ifelse(sign(conf.low) == sign(conf.high), "sig", "ns"),
+         Trait = factor(Trait, traits$short_name),
+         Outcome = factor(Outcome, outcomes$short_name, outcomes$long_name),
+         Moderator = factor(Moderator, c(moders$short_name, stdyModers$short_name), c(moders$long_name, stdyModers$long_name)),
+         Covariate = factor(Covariate, covars$short_name, str_wrap(covars$long_name, 15))) %>%
+  # format values as text, combine estimates and CI's, bold significance
+  mutate_at(vars(estimate, conf.low, conf.high), 
+            ~ifelse(abs(.) < .01, sprintf("%.3f", .), sprintf("%.2f", .))) %>%
+  mutate(est = sprintf("%s<br>[%s, %s]", estimate, conf.low, conf.high),
+         est = ifelse(sig == "sig", sprintf("<strong>%s</strong>", est), est)) %>%
+  # mutate(est = sprintf("%s [%s, %s]", estimate, conf.low, conf.high),
+  # est = ifelse(sig == "sig", sprintf("\\textbf{%s}", est), est)) %>%
+  # final reshaping, remove extra columns, arrange values, and change to wide format
+  select(-estimate, -conf.low, -conf.high, -sig) %>%
+  arrange(type, Outcome, Trait, Moderator, Covariate) %>%
+  pivot_wider(names_from = "Trait", values_from = "est") 
+
+ipd1a_mod_tab_fun <- function(d, type, out, moder, cov){
+  md <- mapvalues(moder, c(moders$long_name, stdyModers$long_name), c(moders$short_name, stdyModers$short_name), warn_missing = F)
+  o <- mapvalues(out, outcomes$long_name, outcomes$short_name, warn_missing = F)
+  cv <- mapvalues(cov, covars$long_name, covars$short_name, warn_missing = F)
+  cs <- rep(1,6)
+  names(cs) <- c(" ", paste0("<strong>", traits$long_name, "</strong>"))
+  # cln <- if(length(unique(d$term2)) == 1) c("Covariate", rep("\\textit{b} [CI]", 5)) else c(" ", "Term", rep("\\textit{b} [CI]", 5))
+  cln <- c("Term", rep("<em>b</em> [CI]", 5))
+  al <- c("r", rep("c", 5))
+  # caption 
+  cap <- if(md == "none") "1B Pooled Analysis of Individual Participant Data with Cluster Corrected Standard Errors: All Model Estimates of Fixed Effect Personality-Crystallized Domain Associations" else sprintf("1B Pooled Analysis of Individual Participant Data with Cluster Corrected Standard Errors: All Model Estimates of Fixed Effect %s Moderation of Personality-Crystallized Domain Associations", md)
+  
+  # kable the table
+  tab <- d %>%
+    arrange(term) %>%
+    kable(., "html"
+    # kable(., "latex"
+          , booktabs = T
+          , escape = F
+          , col.names = cln
+          , align = al
+          , caption = cap
+    ) %>% 
+    kable_classic(full_width = F, html_font = "Times New Roman") %>%
+    # kable_styling(full_width = F, font_size = 7) %>%
+    add_header_above(cs, escape = F)
+  # save the resulting html table
+  save_kable(tab, file = sprintf("%s/results/1b_ipd_fixef/%s/tables/all terms/%s-%s-%s.html"
+                                 , local_path, type, o, md, cv))
+  return(tab) # return the html table
+}
+
+ipd1b_mod_tab <- ipd1b_mod_tab %>%
+  group_by(type, Outcome, Moderator, Covariate) %>%
+  nest() %>%
+  ungroup() %>%
+  mutate(tab = pmap(list(data, type, Outcome, Moderator, Covariate), ipd1a_mod_tab_fun))
+```
+
+##### Figures  
+
+###### Overall Forest  
+
+```{r ipd1a overall forest}
+ipd1b_fx_plot_fun <- function(df, mod, type, cov){
+  m <- mapvalues(mod, c(moders$short_name, stdyModers$short_name), c(moders$long_name, stdyModers$long_name), warn_missing = F)
+  cv <- mapvalues(cov, covars$short_name, covars$long_name, warn_missing = F)
+  d <- round(max(abs(min(df$estimate)), abs(max(df$estimate))), 3)
+  # stds <- unique(df$study)
+  lim <- c(0-d-(d/2.5), 0+d+(d/2.5))
+  brk <- if(d > .01) round(c(0-d-(d/5), 0, 0+d+(d/5)),2) else round(c(0-d-(d/5), 0, 0+d+(d/5)),3) 
+  # lim_high <- lim[2]*4
+  lab <- str_replace(brk, "^0.", ".")#str_remove(round(c(0-d-(d/5), 0, 0+d+(d/5)),2), "^0")
+  shapes <- c(15, 16, 17, 18)[1:length(unique(df$term))]
+  lt <- rep("solid", length(unique(df$term)))
+  titl <- if(mod == "none"){NULL} else {sprintf("%s Moderation of Personality-Outcome Associations", m)}
+  titl <- if(!cov %in% c("none", "all")) paste(cv, "Adjusted", titl, collapse = " ") else paste(cv, titl, collapse = " ")
+  leg <- if(length(unique(df$term)) > 1){"bottom"} else {"none"}
+  p <- df %>%
+    mutate(conf.low = ifelse(conf.low < lim[1], lim[1], conf.low),
+           conf.high = ifelse(conf.high > lim[2], lim[2], conf.high)) %>% 
+  ggplot(aes(x = Outcome, y = estimate)) +
+    scale_y_continuous(limits = lim, breaks = brk, labels = lab) + 
+    scale_size_manual(values = c(1.4, 1.8)) +
+    scale_shape_manual(values = shapes) +
+    scale_color_manual(values = c("black", "blue")) +
+    scale_linetype_manual(values = lt) +
+    geom_hline(aes(yintercept = 0), size = .25, color = "gray50") +
+    geom_errorbar(aes(ymin = conf.low, ymax = conf.high, linetype = term)
+                  , width = 0
+                  , position = position_dodge(width = .9)) + 
+    geom_point(aes(color = sig, size = sig, shape = term)
+                  , position = position_dodge(width = .9)) +
+    labs(x = NULL
+         , y = "Estimate (POMP)"
+         , title = titl
+         , subtitle = "Method 1B: Pooled Linear Regression with Cluster-Corrected Standard Errors"
+         ) +
+    guides(color = "none", size = "none") +
+    facet_grid(~Trait, scales = "free_y", space = "free") +
+    coord_flip() +
+    theme_classic() +
+    theme(legend.position = leg,
+          plot.title = element_text(face = "bold", size = rel(1.2), hjust = .5),
+          plot.subtitle = element_text(hjust = .5),
+          panel.background = element_rect(color = "black", fill = "white"),
+          strip.background = element_blank(),
+          strip.text = element_text(face = "bold", color = "black", size = rel(1.4)),
+          axis.text = element_text(color = "black"),
+          axis.text.y = element_text(size = rel(1)))
+  ht <- length(unique(df$Outcome)); ht2 <- length(unique(df$term))
+  wdt <- length(unique(df$Trait))
+ggsave(file = sprintf("%s/results/1b_ipd_fixef/%s/figures/overall forest/%s_%s_fixed.png", local_path, type, mod, cov), width = wdt*2, height = ht+ht2)
+rm(p)
+gc()
+return(T)
+}
+
+nested_ipd1b_fixef %>%
+  unnest(fx) %>%
+    filter((Moderator == "none" & term == "p_value")|
+          (Moderator != "none" & grepl("p_value:", term))) %>%
+    mutate(sig = ifelse(sign(conf.low) == sign(conf.high), "sig", "ns"),
+           sig = factor(sig, levels = c("sig","ns")),
+           Trait = factor(Trait, levels = traits$short_name),
+           Outcome = factor(Outcome, levels = outcomes$short_name, labels = str_wrap(outcomes$long_name, 15)),
+           Outcome = forcats::fct_rev(Outcome))  %>%
+  group_by(type, Moderator, Covariate) %>%
+  nest() %>%
+  ungroup() %>%
+  mutate(pmap(list(data, Moderator, type, Covariate), ipd1b_fx_plot_fun))
+```
+
+###### Study-Specific Forest Plots  
+This header is here to simply emphasize that this method does not provide study-specific estimates, unlike Methods 2ab, 3, and 4.  
+
+###### Overall Simple Effects Plots  
+
+```{r ipd1a somple effects}
+loadRData <- function(fileName, type, obj, folder){
+#loads an RData file, and returns it
+    path <- sprintf("%s/results/1b_ipd_fixef/%s/%s/%s", local_path, type, folder, fileName)
+    load(path)
+    get(ls()[grepl(obj, ls())])
+}
+
+## load in "fixed" effects
+## first get file names
+nested_ipd1b_simp <- tibble(type = c("Frequentist", "Bayesian")) %>%
+  mutate(file = map(type, ~list.files(sprintf("%s/results/1b_ipd_fixef/%s/predicted", local_path, .)))) %>%
+  unnest(file) %>%
+  separate(file, c("Outcome", "Trait", "Moderator", "Covariate"), sep = "_", remove = F) %>% 
+  ## read in the files
+  mutate(Covariate = str_remove(Covariate, ".RData"),
+         pred = map2(file, type, ~loadRData(.x, .y, "pred.fx", "predicted"))) %>%
+  select(-file) 
+nested_ipd1a_simp
+```
+
+
+```{r ipd1a simple effects plots}
+simp_eff_fun <- function(df, outcome, mod, type, cov){ 
+  print(paste(outcome, mod))
+  o <- mapvalues(outcome, outcomes$short_name, outcomes$long_name, warn_missing = F)
+  cv <- mapvalues(cov, covars$short_name, covars$long_name, warn_missing = F)
+  m <- mapvalues(mod, moders$short_name, moders$long_name, warn_missing = F)
+  d <- round(max(abs(min(df$pred)), abs(max(df$pred))), 3)
+  mini <- if(d > 2) .05 else 0-(d+(d/5))
+  maxi <- if(d > 2) 2.05 else 0+d+(d/5)
+  lim <- c(mini, maxi)
+  brk <- if(d > 2) c(0, 1, 2) else{round(c(0-d-(d/10), 0, 0+d+(d/10)),2)}
+  lab <- if(d > 2){c("0", "1", "2")} else{str_remove(c(round(0-d-(d/10),2), 0, round(0+d+(d/10),2)), "^0")}
+  titl <- if(mod == "none"){o} else {sprintf("%s: Personality x %s Simple Effects", o, m)}
+  # colnames(df)[colnames(df) == mod] <- "mod_value"
+  df <- df %>% unclass %>% data.frame
+  df$mod_value <- df[,mod]
+  df <- df %>% select(-all_of(mod)) %>% as_tibble
+  if(class(df$mod_value) == "factor"){df <- df %>% mutate(mod_fac = factor(mod_value))} 
+  else{df <- df %>%
+    group_by(Trait) %>%
+    mutate(mod_fac = factor(mod_value, levels = unique(mod_value), labels = c("-1 SD", "M", "+1 SD"))) %>%
+    ungroup()
+  }
+  lt <- c("dotted", "solid", "dashed", "dotdash", "longdash", "twodash")[1:length(unique(df$mod_fac))]
+  
+  df %>%
+    mutate(Trait = factor(Trait, levels = traits$short_name, labels = traits$long_name),
+           lower = ifelse(lower < 4, 4, lower),
+           upper = ifelse(upper > 10, 10, upper)) %>%
+    ggplot(aes(x = p_value
+               , y = pred
+               , group  = mod_fac))  +
+      scale_y_continuous(limits = c(4,10)
+                         , breaks = c(4, 6, 8, 10)
+                         , labels = c(4, 6, 8, 10)) +
+      scale_linetype_manual(values = lt) +
+      geom_ribbon(aes(ymin = lower
+                      , ymax = upper
+                      , fill = mod_fac)
+                  , alpha = .25) +
+      geom_line(aes(linetype = mod_fac)) +
+      labs(x = "Personality (POMP)"
+           , y = paste(o, "(POMP)")
+           , title = titl
+           , linetype = m
+           , fill = m
+           , subtitle = "Method 1B: Pooled Linear Regression with Cluster-Corrected Standard Errors") +
+      facet_wrap(~Trait, nrow = 3) +
+      theme_classic() +
+      theme(legend.position = "bottom"
+            , plot.title = element_text(face = "bold", size = rel(1.2), hjust = .5)
+            , strip.background = element_rect(fill = "black")
+            , strip.text = element_text(face = "bold", color = "white")
+            , axis.text = element_text(color = "black"))
+  ggsave(file = sprintf("%s/results/1b_ipd_fixef/%s/figures/overall simple effects/%s_%s_%s.png", local_path, type, outcome, mod, cov), width = 6, height = 6)
+}
+
+ipd1b_se_plot <- nested_ipd1b_simp %>%
+  group_by(type, Outcome, Moderator, Covariate) %>%
+  nest() %>%
+  ungroup() %>%
+  mutate(data = map(data, ~(.) %>% unnest(pred)),
+         plot = pmap(list(data, Outcome, Moderator, type, Covariate), simp_eff_fun))
+```
+
+###### Study-Specific Simple Effects Plots  
+This header is here to simply emphasize that this method does not provide study-specific estimates, unlike Methods 2ab, 3, and 4.  
+
+```{r}
+rm(list = ls()[grepl("ipd1b", ls())])
+```

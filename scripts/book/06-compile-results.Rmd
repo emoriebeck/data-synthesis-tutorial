@@ -1,0 +1,1170 @@
+---
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+# Method 3: One-Stage Individual Participant Analyses Reported Together  
+
+## Comparisons Across the Taxonomy  
+We again need to combine data. However, rather than combining data across studies, for the two-stage approach, we'll be combining data within studies in order to run separate analyses for each before combining via meta-analytic tools.  
+
+To do: ADD HETEROGENEITY ESTIMATES AND OTHER META-ANALYTIC TERMS
+
+### Tables  
+#### Meta-Analytic Estimates  
+```{r ipd meta load fx results}
+loadRData <- function(fileName, type, method, obj, dir){
+#loads an RData file, and returns it
+    path <- sprintf("%s/results/%s/%s/%s/%s", local_path, method, type, dir, fileName)
+    # print(path)
+    load(path)
+    get(ls()[grepl(obj, ls())])
+}
+
+nested_ipd_fx <- crossing(type = c("Frequentist", "Bayesian")
+         , method = c("1a_ipd_reg", "1b_ipd_fixef", "2a_ipd_dc", "2b_ipd_mlm", "3_ipd_meta")) %>%
+  mutate(dir = ifelse(method == "3_ipd_meta", "metaSummary", "summary")
+         , file = pmap(list(method, type, dir, local_path), ~list.files(sprintf("%s/results/%s/%s/%s", ..4, ..1, ..2, ..3)))) %>%
+  # filter(type != "Bayesian") %>%
+  unnest(file) %>%
+  mutate(fx = pmap(list(file, type, method, "fx", dir), loadRData)) %>%
+  separate(file, c("Outcome", "Trait", "Moderator", "Covariate"), sep = "_") %>%
+  mutate(Covariate = str_remove_all(Covariate, ".RData"))
+
+# loadRData <- function(fileName, obj){
+# #loads an RData file, and returns it
+#     path <- sprintf("%s/%s", res_path, fileName)
+#     # print(path)
+#     load(url(path))
+#     get(ls()[grepl(obj, ls())])
+# }
+
+# library(httr)
+# repo_req <- GET("https://api.github.com/repos/emoriebeck/data-synthesis-tutorial/git/trees/main?recursive=1")
+# stop_for_status(repo_req)
+# repo_filelist <- unlist(lapply(content(req)$tree, "[", "path"), use.names = F)
+# 
+# list_files_github <- function(method, type, dir){
+#   grep(sprintf("results/%s/%s/%s", method, type, dir), repo_filelist, value = TRUE, fixed = TRUE)
+# }
+# 
+# nested_ipd_fx <- crossing(type = c("Frequentist", "Bayesian")
+#          , method = c("1a_ipd_reg", "1b_ipd_fixef", "2a_ipd_dc", "2b_ipd_mlm", "3_ipd_meta")) %>%
+#   mutate(dir = ifelse(method == "3_ipd_meta", "metaSummary", "summary")
+#          , file = pmap(list(method, type, dir), list_files_github)) %>%
+#          # , file = pmap(list(method, type, dir, local_path), ~list.files(sprintf("%s/results/%s/%s/%s", ..4, ..1, ..2, ..3)))) %>%
+#   # filter(type != "Bayesian") %>%
+#   unnest(file) %>%
+#   filter(grepl(".RData", file)) %>%
+#   mutate(fx = pmap(list(file, "fx"), loadRData)) 
+```
+
+```{r}
+# cols_ord <- paste(rep(c("b", "CI"), times = 5), rep(c("E", "A", "C", "N", "O"), each = 2), sep = "_")
+
+ipd_fx_tab <-
+  nested_ipd_fx %>%
+  unnest(fx) %>%
+  mutate(term = ifelse(method == "3_ipd_meta", 
+                       str_replace_all(term, "metamod", paste0("p_value:", Moderator)), term)) %>%
+  filter((Moderator == "none" & term == "p_value") |
+         (Moderator != "none" & grepl("p_value:", term)
+          & !grepl("p_value:study", term)
+          & !(grepl("cor_", term) | grepl("sd_", term)))) %>%
+  # filter(!Moderator %in% unique(stdyModers$short_name)) %>%
+  # filter(!Moderator %in% c("scale", "continent", "country")) %>%
+  mutate(sig = ifelse(sign(conf.low) == sign(conf.high), "sig", "ns"),
+         mod_type = ifelse(Moderator %in% moders$short_name, "Person-Level", "Study-Level"),
+         Outcome = factor(Outcome, outcomes$short_name, outcomes$long_name),
+         Covariate = factor(Covariate, covars$short_name, str_wrap(covars$long_name, 15)),
+         term = str_remove_all(term, "p_value:"),
+         term = mapvalues(term, c("scaleBFIMS", "scaleIPIPNEO", "scaleTDAM40", "countryTheNetherlands", "gender")
+                          , c("scaleBFI-S", "scaleIPIP NEO", "scaleTDA-40", "countryThe Netherlands", "genderFemale")),
+         term = str_replace(term, "metamod", Moderator),
+         term = factor(term, c(covars$short_term, moders$short_term, stdyModers$short_term),
+                       c(covars$long_term, moders$long_term, stdyModers$long_term)),
+         Moderator = factor(Moderator, c(moders$short_name, stdyModers$short_name)
+                            , c(moders$long_name, stdyModers$long_name))) %>%
+  mutate_at(vars(estimate, conf.low, conf.high), ~ifelse(abs(.) < .01, sprintf("%.3f", .), sprintf("%.2f", .))) %>%
+  mutate(est = sprintf("%s<br>[%s, %s]", estimate, conf.low, conf.high)
+         , est = ifelse(sig == "sig", sprintf("<strong>%s</strong>", est), est)) %>%
+  # mutate_at(vars(estimate, CI), ~ifelse(sig == "sig", sprintf("\\textbf{%s}", .), .)) %>%
+  select(type, method, Outcome, Trait, Moderator, mod_type, Covariate, term, est) %>%
+  pivot_wider(names_from = "Trait", values_from = est) %>%
+  select(type:term, E, A, C, N, O) 
+```
+
+```{r}
+## table function 
+ipd_fx_tab_fun <- function(d, type, moder_type, cov){
+  md <- mapvalues(moder_type, c("Study-Level", "Person-Level"), c("study", "person")
+                  , warn_missing = F)
+  cv <- mapvalues(cov, covars$long_name, covars$short_name, warn_missing = F)
+  d <- d %>% arrange(method, Moderator)
+  rs <- d %>% mutate(method = factor(method, mthds$old_name, mthds$long_name)) %>%
+    group_by(method) %>% tally() %>% 
+    mutate(end = cumsum(n), start = lag(end) + 1, start = ifelse(is.na(start), 1, start))
+  if(all((d %>% group_by(Moderator, method) %>% tally())$n == 1)){
+    cs <-  rep(1,6)
+    cln <- c(" ", rep("<em>b</em> [CI]", times = 5)) 
+    al <- c("r", rep("c", 5)) 
+    d <- d %>% select(-Moderator)
+  } else {
+    cs <- c(2, rep(1,5))
+    cln <-  c(" ", "Term", rep("<em>b</em> [CI]", times = 5))
+    al <- c("r", "r", rep("c", 5))
+  }
+  names(cs) <- c(" ", traits$short_name)
+  # caption 
+  cap <- if(md == "person") "Cross-Method Comparison of Overall Effects and Person-Level Moderators of Personality-Crystallized Domain Associations" else "Cross-Method Comparison of Overall Study-Level Moderators of Personality-Crystallized Domain Associations"
+  tab <- d %>%
+    select(-method) %>%
+    kable(., "html"
+    # kable(., "latex"
+          , escape = F
+          , col.names = cln
+          , align = al
+          , caption = cap
+    ) %>% 
+    kable_classic(full_width = F, html_font = "Times New Roman") %>%
+    add_header_above(cs) %>%
+    collapse_rows(1, valign = "top", row_group_label_position = "stack")
+  for (i in 1:nrow(rs)) {
+    tab <- tab %>% kableExtra::group_rows(rs$method[i], rs$start[i], rs$end[i])
+  }
+  save_kable(tab, file = sprintf("%s/results/tables/cross-method/overall/%s_%s_%s.html"
+                                 , local_path, type, md, cv))
+  return(tab)
+}
+
+nested_ipd_fx_tab <- ipd_fx_tab %>%
+  filter(Covariate %in% c("Fully Adjusted", "Unadjusted")) %>%
+  group_by(type, mod_type, Outcome, Covariate) %>%
+  nest() %>%
+  ungroup() %>%
+  mutate(tab = pmap(list(data, type, mod_type, Covariate), ipd_fx_tab_fun))
+
+# save(nested_ipd_fx_tab, file = sprintf("%s/manuscript/results/ct_fx_tab.RData", res_path))
+```
+
+```{r}
+nested_ipd_fx_tab$tab[[6]]
+```
+
+
+```{r}
+ipd_fx_tab_stdm <-ipd_fx_tab %>% 
+  filter(type == "Frequentist" & mod_type == "Study-Level" & Covariate %in% "Fully Adjusted" & 
+           !method %in% c("2a_ipd_dc", "1b_ipd_fixef")) %>%
+  pivot_longer(names_to = "Trait"
+               , values_to = "value"
+               , cols = E:O) %>%
+  pivot_wider(names_from = c("method", "Trait")
+              , values_from = "value") 
+
+rs <- ipd_fx_tab_stdm %>% 
+  arrange(type, Outcome, Moderator, term) %>%
+  group_by(Moderator) %>% tally() %>% 
+  mutate(end = cumsum(n), start = lag(end) + 1, start = ifelse(is.na(start), 1, start))
+
+cln1 <- rep(1,16); names(cln1) <- c(" ", rep(c("E", "A", "C", "N", "O"), times = 3))
+cln2 <- c(1, rep(5, 3)); names(cln2) <- c(" ", "Method 1A", "Method 2B", "Method 3")
+
+cap <- "<strong>Table X</strong><br><em>Cross-Method Comparison of Overall Study-Level Moderators of Personality-Crystallized Domain Associations</em>"
+
+tab <- ipd_fx_tab_stdm %>%
+  arrange(type, Outcome, Moderator, term) %>%
+  mutate(term = mapvalues(term, stdyModers$long_term, stdyModers$medium_term)) %>%
+  mutate_at(vars(`1a_ipd_reg_E`:`3_ipd_meta_O`), ~str_replace_all(., "0\\.", ".")) %>%
+  # mutate_at(vars(`1a_ipd_reg_E`:`3_ipd_meta_O`), ~str_replace_all(., "-0.", "-.")) %>%
+  select(-type, -Outcome, -Moderator, -mod_type, -Covariate) %>%
+  kable(., "html"
+        , col.names = c("Term", rep("b [CI]", 15))
+        , align = c("r", rep("c", 15))
+        , escape = F
+        , caption = cap
+        ) %>%
+  kable_classic(full_width = F, html_font = "Times New Roman") %>%
+  add_header_above(cln1) %>%
+  add_header_above(cln2)
+
+for(i in 1:nrow(rs)){
+  tab <- tab %>%
+    kableExtra::group_rows(rs$Moderator[i], rs$start[i], rs$end[i])
+}
+save_kable(tab, file = sprintf("%s/results/tables/cross-method/overall/Frequentist_crystallized_study_all.html", local_path))
+tab
+```
+
+#### Sample-Specific Estimates  
+
+```{r}
+loadRData <- function(fileName, type, method, obj, dir){
+#loads an RData file, and returns it
+    print(paste(type, method, fileName, dir, obj))
+    path <- sprintf("%s/results/%s/%s/%s/%s", local_path, method, type, dir, fileName)
+    load(path)
+    get(ls()[grepl(obj, ls())])
+}
+
+nested_ipd_rx <- 
+  crossing(type = c("Frequentist", "Bayesian")
+         , method = c("2a_ipd_dc", "2b_ipd_mlm", "3_ipd_meta")) %>%
+  mutate(dir = ifelse(method == "3_ipd_meta", "studySummary", "summary")
+         , obj = "rx" # ifelse(method == "3_ipd_meta" & type == "Frequentist", "fx", "rx")
+           , file = pmap(list(method, type, dir, local_path), ~list.files(sprintf("%s/results/%s/%s/%s", ..4, ..1, ..2, ..3)))) %>%
+    # filter(type != "Bayesian") %>%
+    unnest(file) %>%
+    # filter(method == "3_ipd_meta" & type == "Frequentist") %>%
+    separate(file, c("Outcome", "Trait", "Moderator", "Covariate", "study"), sep = "_", remove = F) %>%
+    filter(!Moderator %in% stdyModers$short_name) %>%
+    mutate(rx = pmap(list(file, type, method, obj, dir), loadRData)) %>%
+    mutate(study = str_remove_all(study, ".RData")
+           , Covariate = str_remove_all(Covariate, ".RData")) %>%
+  filter(!Moderator %in% stdyModers$short_name) %>%
+  mutate(rx = ifelse(!is.na(study), map2(rx, study, ~(.x) %>% mutate(study = .y)), rx)) %>%
+  select(-study,  -dir, -file) 
+```
+
+```{r}
+cols_ord <- paste(rep(c("b", "CI"), times = 5), rep(c("E", "A", "C", "N", "O"), each = 2), sep = "_")
+
+ipd_rx_tab <- 
+  nested_ipd_rx %>%
+  unnest(rx) %>%
+  mutate(term = ifelse(is.na(term), names, term)) %>%
+  filter((Moderator == "none" & term == "p_value") |
+         (Moderator != "none" & grepl("p_value:", term))) %>%
+  mutate(sig = ifelse(sign(conf.low) == sign(conf.high), "sig", "ns"),
+         Outcome = factor(Outcome, outcomes$short_name, outcomes$long_name),
+         Covariate = factor(Covariate, covars$short_name, str_wrap(covars$long_name, 15)),
+         term = str_remove_all(term, "p_value:"),
+         term = factor(term, c(covars$short_term, moders$short_term, stdyModers$short_term),
+                       c(covars$long_term, moders$long_term, stdyModers$long_term)),
+         Moderator = factor(Moderator, c(moders$short_name, stdyModers$short_name)
+                            , c(moders$long_name, stdyModers$long_name))) %>%
+  mutate_at(vars(estimate, conf.low, conf.high), ~ifelse(abs(.) < .01, sprintf("%.3f", .), sprintf("%.2f", .))) %>%
+  mutate(CI = sprintf("[%s, %s]", conf.low, conf.high)) %>%
+  mutate_at(vars(estimate, CI), ~ifelse(sig == "sig", sprintf("<strong>%s</strong>", .), .)) %>%
+  select(type, method, Outcome, Trait, Moderator, Covariate, study, term, b = estimate, CI) %>%
+  pivot_wider(names_from = "Trait", values_from = c("b", "CI")) %>%
+  select(type:term, study, one_of(cols_ord)) 
+```
+
+```{r}
+ipd_rx_tab_fun <- function(d, type, moder){
+  print(moder)
+  md <- mapvalues(moder, moders$long_name, moders$short_name, warn_missing = F)
+  d <- d %>% arrange(Covariate, study, method)
+  rs <- d %>% group_by(Covariate) %>% tally() %>% 
+    mutate(end = cumsum(n), start = lag(end) + 1, start = ifelse(is.na(start), 1, start))
+  cs <- if(length(unique(d$term)) == 1) rep(2,6) else c(3, rep(2,5))
+  names(cs) <- c(" ", traits$short_name)
+  cln <- if(length(unique(d$term)) == 1) c(" ", "Study", rep(c("<em>b</em>", "CI"), times = 5)) else c(" ", "Study", "Term", rep(c("<em>b</em>", "[CI]"), times = 5))
+  al <- if(length(unique(d$term))) c("r", "r", rep("c", 10)) else c("r", "r", "r", rep("c", 10))
+  if(length(unique(d$term)) == 1) {
+    d <- d %>% select(-term); dubs <- F
+  } #else {
+  #   rs2 <- d %>% group_by(Covariate, method) %>% tally() %>% 
+  #   mutate(end = cumsum(n), start = lag(end) + 1, start = ifelse(is.na(start), 1, start))
+  #   d <- d %>% select(-method); dubs <- T
+  # }
+  # caption 
+  cap <- if(md == "none") "Cross-Method Comparison of Study-Specific Effects of Personality-Crystallized Domain Associations" else sprintf("Cross-Method Comparison of Study-Specific %s Moderation of Personality-Crystallized Domain Associations", md)
+  tab <- d %>%
+    select(-Covariate) %>%
+    kable(., "html"
+          , escape = F
+          , booktabs = T
+          , col.names = cln
+          , align = al
+          , caption = cap
+    ) %>% 
+    kable_classic(full_width = F, html_font = "Times New Roman") %>%
+    add_header_above(cs) %>%
+    collapse_rows(1, valign = "top", row_group_label_position = "stack")
+  for (i in 1:nrow(rs)) {
+    tab <- tab %>% kableExtra::group_rows(rs$Covariate[i], rs$start[i], rs$end[i])
+  }
+  # if(dubs == T) for(i in 1:nrow(rs2)) {
+  #   tab <- tab %>% kableExtra::group_rows(rs2$method[i], rs2$start[i], rs2$end[i]
+  #                                         , indent = T, hline_after = F)
+  # }
+  save_kable(tab, file = sprintf("%s/results/tables/cross-method/study-specific/%s_%s.html"
+                                 , local_path, type, md))
+  return(tab)
+}
+
+nested_ipd_rx_tab <- ipd_rx_tab %>%
+  mutate(study = mapvalues(study, c("BASEI", "OCTOTWIN"), c("BASE-I", "OCTO-TWIN"))) %>%
+  select(type, Moderator, Outcome, Covariate, study, method, term, everything()) %>%
+  group_by(type, Moderator, Outcome) %>%
+  nest() %>%
+  ungroup() %>%
+  mutate(tab = pmap(list(data, type, Moderator), ipd_rx_tab_fun))
+```
+
+```{r, results = 'asis'}
+tmp <- nested_ipd_rx_tab %>% filter(type == "Frequentist")
+for(i in 1:4){
+  cat("#####", as.character(tmp$Moderator[[i]]), "\n\n")
+  print(tmp$tab[[i]])
+}
+```
+
+#### Heterogeneity  
+
+```{r ipd meta load fx results, eval = F}
+loadRData <- function(fileName, type, method, obj, dir){
+#loads an RData file, and returns it
+    path <- sprintf("%s/results/%s/%s/%s/%s", local_path, method, type, dir, fileName)
+    # print(path)
+    load(path)
+    get(ls()[grepl(obj, ls())])
+}
+
+nested_ipd_fx <- crossing(type = c("Frequentist", "Bayesian")
+         , method = c("2b_ipd_mlm", "3_ipd_meta")) %>%
+  mutate(dir = ifelse(method == "3_ipd_meta", "metaHetero", "heterogeneity")
+         , file = pmap(list(method, type, dir, local_path), ~list.files(sprintf("%s/results/%s/%s/%s", ..4, ..1, ..2, ..3)))) %>%
+  # filter(type != "Bayesian") %>%
+  unnest(file) %>%
+  mutate(fx = pmap(list(file, type, method, "fx", dir), loadRData)) %>%
+  separate(file, c("Outcome", "Trait", "Moderator", "Covariate"), sep = "_") %>%
+  mutate(Covariate = str_remove_all(Covariate, ".RData"))
+```
+
+### Figures  
+#### Meta-Analytic Estimates  
+
+```{r}
+fx_forest_fun <- function(df, outcome, mod, type, cov, mthd){
+  print(paste(outcome, mod))
+  meth <- mapvalues(mthd, mthds$old_name, mthds$long_name, warn_missing = F)
+  m <- mapvalues(mod, moders$long_name, moders$short_name, warn_missing = F)
+  d <- round(max(abs(min(df$estimate)), abs(max(df$estimate))), 3)
+  # stds <- unique(df$study)
+  lim <- c(0-d-(d/2.5), 0+d+(d/2.5))
+  brk <- if(d > .01) round(c(0-d-(d/5), 0, 0+d+(d/5)),2) else round(c(0-d-(d/5), 0, 0+d+(d/5)),3) 
+  lim_high <- lim[2]*4
+  lab <- str_replace(brk, "^0.", ".")#str_remove(round(c(0-d-(d/5), 0, 0+d+(d/5)),2), "^0")
+  shapes <- c(15, 16, 17, 18)[1:length(unique(df$term))]
+  lt <- rep("solid", length(unique(df$term)))
+  titl <- if(mod == "none"){"Main Effects"} else {sprintf("Personality x %s", mod)}
+  leg <- if(length(unique(df$term)) > 1){"bottom"} else {"none"}
+  trm <- if(mod != "None") paste("Personality x", unique(df$term[!is.na(df$term)]))
+  df <- df %>% full_join(tibble(Trait = " ", estimate = NA, n = NA))
+  # df <- df %>% arrange(estimate)
+  trts <- df$Trait[!df$Trait %in% c(" ")]
+  df <- df %>%
+    mutate_at(vars(estimate, conf.low, conf.high),
+      lst(f = ~ifelse(abs(.) < .001, sprintf("%.4f", .), ifelse(abs(.) < .01, sprintf("%.3f", .), sprintf("%.2f", .))))) %>%
+    mutate(Trait = factor(Trait, rev(c(" ", traits$short_name)), rev(c(" ", traits$long_name)))
+           , lb = ifelse(conf.low < lim[1], "lower"
+                         , ifelse(conf.high > lim[2], "upper", "neither"))
+           , conf.low2 = ifelse(conf.low < lim[1], lim[1], conf.low)
+           , conf.high2 = ifelse(conf.high > lim[2], lim[2], conf.high)
+           , est = ifelse(Trait != " ", sprintf("%s [%s, %s]", estimate_f, conf.low_f, conf.high_f), "")
+           ) %>% arrange(Trait)
+  p1 <- df %>%
+    ggplot(aes(x = Trait, y = estimate)) + 
+    geom_errorbar(aes(ymin = conf.low2, ymax = conf.high2)
+                  , position = "dodge"
+                  , width = 0) + 
+    geom_point(aes(shape = term, size = term)) +
+    geom_segment(data = df %>% filter(lb == "lower")
+                 , aes(y = conf.high2, yend = conf.low2, xend = Trait)
+                 , arrow = arrow(type = "closed", length = unit(0.1, "cm"))) +
+    geom_segment(data = df %>% filter(lb == "upper")
+                 , aes(y = conf.low2, yend = conf.high2, xend = Trait)
+                 , arrow = arrow(type = "closed", length = unit(0.1, "cm"))) +
+    geom_hline(aes(yintercept = 0), linetype = "dashed", size = .5) +
+    geom_vline(aes(xintercept = length(trts) + .5)) +
+    annotate("rect", xmin = length(trts) + .6, xmax = Inf, ymin = -Inf, ymax = Inf, fill = "white") +
+    annotate("text", label = "b [CI]", x = length(trts) + .75, y = lim_high*.75, hjust = .5, vjust = 0, fontface = 2, size = 3) +
+    annotate("text", label = trm, x = length(trts) + .75, y = 0, hjust = .5, vjust = 0, fontface = 2, size = 3) +
+    geom_text(aes(y = lim_high*.75, label = est), size = 3.5) +
+    scale_y_continuous(limits = c(lim[1], lim_high), breaks = brk, labels = lab) + 
+    scale_size_manual(values = c(3,2)) + 
+    scale_shape_manual(values = c(15, 16)) +
+    labs(x = NULL
+         , y = "Estimate"
+         # , title = meth
+    ) +
+    coord_flip() + 
+    theme_classic() + 
+    theme(legend.position = "none"
+          , axis.text = element_text(face = "bold")
+          , axis.title = element_text(face = "bold")
+          , plot.title = element_text(face = "bold", hjust = .5)
+          , axis.ticks.y = element_blank()
+          , axis.line.y = element_blank()
+          , axis.line.x.top = element_line(size = 1)
+          # , panel.background = element_rect(fill = "transparent", colour = NA)
+          # , plot.background = element_rect(fill = "transparent", colour = NA)
+          )
+  
+  my_theme <- function(...) {
+    theme_classic() + 
+      theme(plot.title = element_text(face = "italic"))
+  }
+  title_theme <- calc_element("plot.title", my_theme())
+  ttl <- ggdraw() + 
+      draw_label(
+          str_wrap(meth, 50),
+          fontfamily = title_theme$family,
+          fontface = title_theme$face,
+          size = title_theme$size-2
+      )
+  p <- cowplot::plot_grid(ttl, p1, rel_heights = c(.15, .85), nrow = 2)
+  return(p)  
+}
+
+nested_ipd_fx_fig <- nested_ipd_fx %>%
+  unnest(fx) %>%
+  filter((Moderator == "none" & term == "p_value") |
+         (Moderator != "none" & grepl("p_value:", term)
+          & !grepl("p_value:study", term)
+          & !(grepl("cor_", term) | grepl("sd_", term)))) %>%
+  # filter(!Moderator %in% unique(stdyModers$short_name)) %>%
+  filter(!Moderator %in% c("scale", "continent", "country")) %>%
+  mutate(sig = ifelse(sign(conf.low) == sign(conf.high), "sig", "ns"),
+         Outcome = factor(Outcome, outcomes$short_name, outcomes$long_name),
+         Covariate = factor(Covariate, covars$short_name, str_wrap(covars$long_name, 15)),
+         term = str_remove_all(term, "p_value:"),
+         term = str_replace(term, "metamod", Moderator),
+         term = factor(term, c(covars$short_term, moders$short_term, stdyModers$short_term),
+                       c(covars$long_term, moders$long_term, stdyModers$long_term)),
+         Moderator = factor(Moderator, c(moders$short_name, stdyModers$short_name)
+                            , c(moders$long_name, stdyModers$long_name))) %>%
+  group_by(type, Moderator, Covariate, method, Outcome) %>%
+  nest() %>%
+  ungroup() %>%
+  mutate(p = pmap(list(data, Outcome, Moderator, type, Covariate, method), possibly(fx_forest_fun, NA_real_)))
+
+fx_forest_comb_fun <- function(d, type, out, mod, cov){
+  m <- mapvalues(mod, c(moders$long_name, stdyModers$long_name), c(moders$short_name, stdyModers$short_name), warn_missing = F)
+  o <- mapvalues(out, outcomes$long_name, outcomes$short_name, warn_missing = F)
+  cv <- mapvalues(cov, covars$long_name, covars$short_name, warn_missing = F)
+  p1 <- plot_grid(plotlist = d$p
+            , nrow = ceiling(nrow(d)/2))
+  titl <- if(mod == "None") sprintf("Personality-%s Associations", out) else sprintf("%s Moderators of Personality x %s Associations", mod, out)
+  titl <- str_wrap(if(grepl("djust", cov)) sprintf("%s: %s %s %s", out, cov, type, titl) else sprintf("%s: %s Adjusted %s %s", out, cov, type, titl), 60)
+  my_theme <- function(...) {
+    theme_classic() + 
+      theme(plot.title = element_text(face = "bold"))
+  }
+  title_theme <- calc_element("plot.title", my_theme())
+  ttl <- ggdraw() + 
+      draw_label(
+          titl,
+          fontfamily = title_theme$family,
+          fontface = title_theme$face,
+          size = title_theme$size-1
+      )
+  p <- cowplot::plot_grid(ttl, p1, rel_heights = c(.1, .9), nrow = 2)
+
+  ht <- nrow(d)
+  ggsave(file = sprintf("%s/results/figures/cross-method/overall forest/%s_%s_%s_%s_fixed.png"
+                        , local_path, o, type, m, cv)
+         , width = 10, height = ht*1.5)
+  ggsave(file = sprintf("%s/results/figures/cross-method/overall forest/%s_%s_%s_%s_fixed.pdf"
+                        , local_path, o, type, m, cv)
+         , width = 10, height = ht*1.5)
+  rm(p)
+  gc()
+  return(T)
+}
+
+nested_ipd_fx_fig <- nested_ipd_fx_fig %>%
+  group_by(type, Outcome, Moderator, Covariate) %>%
+  nest() %>% 
+  ungroup() %>%
+  mutate(p = pmap(list(data, type, Outcome, Moderator, Covariate), fx_forest_comb_fun))
+```
+
+```{r}
+include_graphics("https://github.com/emoriebeck/data-synthesis-tutorial/raw/main/results/figures/cross-method/overall%20forest/crystallized_Frequentist_none_all_fixed.pdf")
+```
+
+#### Study-Specific Estimates  
+
+```{r}
+loadRData <- function(fileName, type, method, obj){
+#loads an RData file, and returns it
+    # print(paste(type, method, fileName, dir, obj))
+    path <- sprintf("%s/results/%s/%s/figures/study specific forest/rdata/%s", local_path, method, type, fileName)
+    load(path)
+    get(ls()[ls() == obj])
+}
+
+nested_ipd_fp <- 
+  crossing(type = c("Frequentist", "Bayesian")
+         , method = c("2a_ipd_dc", "2b_ipd_mlm", "3_ipd_meta")) %>%
+  mutate(file = pmap(list(method, type, local_path), ~list.files(sprintf("%s/results/%s/%s/figures/study specific forest/rdata", ..3, ..1, ..2)))) %>%
+    # filter(type != "Bayesian") %>%
+    unnest(file) %>%
+    # filter(method == "3_ipd_meta" & type == "Frequentist") %>%
+    mutate(p = pmap(list(file, type, method, "p"), loadRData)) %>%
+    separate(file, c("Outcome", "Trait", "Moderator", "Covariate"), sep = "_") %>%
+    mutate(Covariate = str_remove_all(Covariate, ".RData")) %>%
+  filter(!Moderator %in% stdyModers$short_name) %>%
+  left_join(
+    nested_ipd_rx %>%
+      unnest(rx) %>%
+      mutate(term = ifelse(is.na(term), names, term)) %>%
+      filter((Moderator == "none" & term == "p_value") |
+             (Moderator != "none" & grepl("p_value:", term))) %>%
+      mutate(study = mapvalues(study, c("BASEI", "OCTOTWIN"), c("BASE-I", "OCTO-TWIN"))) %>%
+      group_by(type, method, Outcome, Trait, Moderator, Covariate) %>%
+      summarize(nstd = n()) %>%
+      ungroup()
+  )
+```
+
+```{r}
+ipd_study_fp_fun <- function(d, outcome, cov, mod, type){
+  print(paste(outcome, cov, mod, type))
+  o <- mapvalues(outcome, outcomes$short_name, outcomes$long_name, warn_missing = F)
+  cv <- mapvalues(cov, covars$short_name, covars$long_name, warn_missing = F)
+  md <- mapvalues(mod, moders$short_name, moders$long_name, warn_missing = F)
+  titl <- paste0(o, ",")
+  titl <- if(!cov %in% c("none", "all")) paste(titl, cv, "Adjusted", collapse = ", ") else paste(titl, cv, collapse = ", ")
+  ns <- d %>% group_by(method) %>% mutate(nstd = ((nstd + 2))/sum(nstd+2)) %>% group_by(Trait) %>% summarize(nstd = mean(nstd))
+  # + theme(panel.background = element_rect(fill = "transparent", colour = NA),  plot.background = element_rect(fill = "transparent", colour = NA))
+  my_theme <- function(...) {
+    theme_classic() + 
+      theme(plot.title = element_text(face = "bold.italic"))
+  }
+  title_theme <- calc_element("plot.title", my_theme())
+  p1 <- plot_grid(
+    d$p[[1]]  
+    , d$p[[2]]
+    , d$p[[3]]
+    , d$p[[4]]
+    , d$p[[5]]
+    , nrow = 5
+    , ncol = 1
+    , rel_heights = ns$nstd
+    , axis = "tblr"
+    , align = "hv"
+    )
+  ttl <- ggdraw() + 
+         draw_label(
+          str_wrap(mthds$long_name[3], 40),
+          fontfamily = title_theme$family,
+          fontface = title_theme$face,
+          size = title_theme$size 
+      )
+  p1 <- plot_grid(
+    ttl, p1, rel_heights = c(.05, .95), ncol = 1
+  )
+  
+  p2 <- plot_grid(
+    d$p[[6]]
+    , d$p[[7]]
+    , d$p[[8]]
+    , d$p[[9]]
+    , d$p[[10]]
+    , nrow = 5
+    , ncol = 1
+    , rel_heights = ns$nstd
+    , axis = "tblr"
+    , align = "hv"
+  )
+  ttl <- ggdraw() + 
+         draw_label(
+          str_wrap(mthds$long_name[4], 40),
+          fontfamily = title_theme$family,
+          fontface = title_theme$face,
+          size = title_theme$size
+      )
+  p2 <- plot_grid(
+    ttl, p2, rel_heights = c(.05, .95), ncol = 1
+  )
+  
+  p3 <- plot_grid(
+    d$p[[11]]
+    , d$p[[12]]
+    , d$p[[13]]
+    , d$p[[14]] 
+    , d$p[[15]]
+    , nrow = 5
+    , ncol = 1
+    , rel_heights = ns$nstd
+    , axis = "tblr"
+    , align = "hv"
+  )
+  ttl <- ggdraw() + 
+         draw_label(
+          str_wrap(mthds$long_name[5], 40),
+          fontfamily = title_theme$family,
+          fontface = title_theme$face,
+          size = title_theme$size 
+      )
+  p3 <- plot_grid(
+    ttl, p3, rel_heights = c(.05, .95), ncol = 1
+  )
+  
+  p <- plot_grid(
+    p1, p2, p3
+    , ncol = 3
+  )
+  
+  my_theme <- function(...) {
+    theme_classic() + 
+      theme(plot.title = element_text(face = "bold", size = rel(1.8)))
+  }
+  
+  title_theme <- calc_element("plot.title", my_theme())
+  
+  ttl <- ggdraw() + 
+         draw_label(
+          str_wrap("Point Estimates Are Quite Consistent Across Methods, While Confidence Intervals Vary Slightly Across Methods, Especially for Methods 2A and 3 versus 2B", 80),
+          fontfamily = title_theme$family,
+          fontface = title_theme$face,
+          size = title_theme$size 
+      )
+  p <- plot_grid(
+    ttl, p, rel_heights = c(.05, .95), ncol = 1
+  )
+  
+  ggsave(p, 
+         file = sprintf("%s/results/figures/cross-method/study-specific forest/%s-%s-%s-%s.png", local_path, type, outcome, mod, cov)
+         , width = 14
+         , height = 14)
+  ggsave(p, 
+         file = sprintf("%s/results/figures/cross-method/study-specific forest/%s-%s-%s-%s.pdf", local_path, type, outcome, mod, cov)
+         , width = 14
+         , height = 14)
+  return(p)
+}
+
+nested_ipd_fp_comb <- nested_ipd_fp %>%
+  mutate(Trait = factor(Trait, traits$short_name)) %>%
+  arrange(type, method, Outcome, Trait, Moderator, Covariate) %>%
+  group_by(type, Outcome, Moderator, Covariate) %>%
+  nest() %>%
+  ungroup() %>%
+  # filter(type == "Frequentist") %>%
+  mutate(p = pmap(list(data, Outcome, Covariate, Moderator, type), ipd_study_fp_fun))
+```
+
+```{r, results = 'asis'}
+tmp <- nested_ipd_fp_comb %>% filter(type == "Frequentist" & Covariate == "all")
+for(i in 1:4){
+  cat("#####", as.character(tmp$Moderator[[i]]), "\n\n")
+  print(tmp$p[[i]])
+}
+```
+
+#### Overall Simple Effects  
+```{r}
+loadRData <- function(fileName, type, method, obj, dir){
+#loads an RData file, and returns it
+    path <- sprintf("%s/results/%s/%s/%s/%s", local_path, method, type, dir, fileName)
+    # print(path)
+    load(path)
+    get(ls()[grepl(obj, ls())])
+}
+
+nested_simp_fx <-
+  crossing(type = c("Frequentist", "Bayesian")
+         , method = c("1a_ipd_reg", "1b_ipd_fixef", "2a_ipd_dc", "2b_ipd_mlm", "3_ipd_meta")) %>%
+  mutate(dirfx = ifelse(method != "3_ipd_meta", "predicted", "metaPredicted")
+         , dirrx = ifelse(method != "3_ipd_meta", "predicted", "studyPredicted")
+         , file = pmap(list(method, type, dirfx, local_path), ~list.files(sprintf("%s/results/%s/%s/%s", ..4, ..1, ..2, ..3)))) %>%
+  unnest(file) %>%
+  # filter(method == "3_ipd_meta") %>%
+  mutate(pred.fx = pmap(list(file, type, method, "pred.fx", dirfx), possibly(loadRData, NA_real_))#,
+         # pred.rx = pmap(list(file, type, method, "pred.rx", dirrx), possibly(loadRData, NA_real_))
+         ) %>%
+  separate(file, c("Outcome", "Trait", "Moderator", "Covariate"), sep = "_") %>%
+  mutate(Covariate = str_remove_all(Covariate, ".RData"))
+```
+
+```{r}
+pred_fx_prep_fun <- function(d, mod, method){
+  # print(paste(mod, method))
+  if(method == "3_ipd_meta" & mod %in% moders$short_name) 
+    return(d)
+  else 
+    d <- d %>% unclass %>% data.frame
+    d$mod_value <- d[,mod]
+    d <- d %>% select(-all_of(mod)) %>% as_tibble
+    if(class(d$mod_value) %in% c("factor", "character")){d <- d %>% mutate(mod_fac = factor(mod_value))} 
+    else {
+      if(mod == "age") d <- d %>% mutate(mod_fac = factor(mod_value, levels = c(-10, 0, 10), labels = c("-10 yrs", "M", "+10 yrs")))
+      else if(mod == "baseYear") d <- d %>% mutate(mod_fac = factor(mod_value, levels = c(-10, 0, 10), labels = c("1990", "200)0", "2010")))
+      else if(mod == "baseAge") d <- d %>% mutate(mod_fac = factor(mod_value, levels = c(-10, 0, 10), labels = c("50", "60", "70")))
+      else if(mod == "predInt") d <- d %>% mutate(mod_fac = factor(mod_value, levels = c(-5, 0, 5), labels = c("-5 yrs", "5 yrs", "+5 yrs")))
+      else if(mod == "education") d <- d %>% mutate(mod_fac = factor(mod_value, levels = c(-5, 0, 5), labels = c("-5 yrs", "12 years", "+5 yrs")))
+      else d <- d %>% mutate(mod_fac = factor(mod_value, levels = unique(mod_value), labels = c("-1 SD", "M", "+1 SD")))
+    }
+  d %>%
+    group_by(p_value, mod_fac) %>%
+    summarize_at(vars(one_of(c("pred", "lower", "upper"))), mean) %>%
+    ungroup() 
+}
+
+nested_simp_fx <- nested_simp_fx %>%
+  # filter(Moderator == "baseAge" & type == "Frequentist" & method == "3_ipd_meta") %>%
+  mutate(pred.fx = pmap(list(pred.fx, Moderator, method), pred_fx_prep_fun))
+```
+
+```{r}
+ipd_se_plot_fun <- function(d, outcome, mod, cov, type){
+  print(paste(mod, cov, type, outcome))
+  o <- mapvalues(outcome, outcomes$short_name, outcomes$long_name, warn_missing = F)
+  cv <- mapvalues(cov, covars$short_name, covars$long_name, warn_missing = F)
+  m <- mapvalues(mod, c(moders$short_name, stdyModers$short_name), c(moders$long_name, stdyModers$long_name), warn_missing = F)
+  titl <- if(mod == "none"){sprintf("%s", o)} else {sprintf("%s: Personality x %s Simple Effects", o, m)}
+  # lt <- c("dotted", "solid", "dashed")[1:length(unique(d$mod_fac))]
+  ht <- length(unique(d$mod_fac))
+  mini <- floor(min(d$pred)); maxi <- 10
+  p <- d %>% 
+    mutate(Trait = factor(Trait, levels = traits$short_name)#, labels = traits$long_name)
+           , method = mapvalues(method, mthds$old_name, str_wrap(mthds$long_name, 28), warn_missing = F)
+           , lower = ifelse(lower < mini, mini, lower)
+           , upper = ifelse(upper > maxi, maxi, upper)) %>%
+    ggplot(aes(x = p_value, y = pred, group = interaction(Trait, mod_fac), linetype = mod_fac)) + 
+      geom_line(aes(#color = mod_fac
+                    , group = mod_fac
+                    , linetype = mod_fac)
+                , size = .75) +
+      geom_ribbon(aes(fill = mod_fac
+                      , group = mod_fac
+                      , ymin = lower
+                      , ymax = upper)
+                  , alpha = .25) +
+      facet_grid(Trait~method, scales = "free") + 
+      scale_y_continuous(limits = c(mini,maxi)
+                         , breaks = seq(mini, maxi, by = 2)
+                         , labels = seq(mini, maxi, by = 2)) +
+      # scale_color_manual(values = cols) +
+      # scale_linetype_manual(values = lt) +
+      labs(x = "Personality Score (POMP)"
+           , y = "Cognition Score (POMP)"
+           # , color = m
+           , fill = m
+           , linetype = m
+           , title = titl
+           # , subtitle = "Method 3: Two-Stage Individual Participant Meta-Analysis"
+           )  +
+      theme_classic() + 
+      theme(legend.position = "bottom"
+            , plot.title = element_text(face = "bold", size = rel(1.2), hjust = .5)
+            , plot.subtitle = element_text(size = rel(1.1), hjust = .5)
+            , strip.background = element_rect(fill = "black")
+            # , strip.background.y = element_rect(fill = "white", color = "white")
+            , strip.text.x = element_text(face = "bold", color = "white", size = rel(1))
+            , strip.text.y = element_text(face = "bold", color = "white", size = rel(1))#, angle = 0)
+            , axis.text = element_text(color = "black"))
+  wdt <- length(unique(d$method))*2
+  ggsave(p, file = sprintf("%s/results/figures/cross-method/overall simple effects/%s_%s_%s_%s.png", local_path, type, outcome, mod, cov)
+         , width = wdt, height = 7)
+  ggsave(p, file = sprintf("%s/results/figures/cross-method/overall simple effects/%s_%s_%s_%s.pdf", local_path, type, outcome, mod, cov)
+         , width = wdt, height = 7)
+  return(p)
+}
+
+nested_simp_fx_fp <- nested_simp_fx %>%
+  filter(!(method %in% c("1b_ipd_fixef", "2a_ipd_dc") & Moderator %in% stdyModers$short_name)) %>%
+  group_by(type, Outcome, Moderator, Covariate) %>%
+  nest() %>% 
+  ungroup() %>%
+  mutate(data = map(data, ~(.) %>% unnest(pred.fx))
+         , p = pmap(list(data, Outcome, Moderator, Covariate, type), ipd_se_plot_fun))
+```
+
+#### Study-Specific Simple Effects  
+```{r}
+loadRData <- function(fileName, type, method, obj, dir){
+#loads an RData file, and returns it
+    path <- sprintf("%s/results/%s/%s/%s/%s", local_path, method, type, dir, fileName)
+    # print(path)
+    load(path)
+    get(ls()[grepl(obj, ls())])
+}
+
+nested_simp_rx <-
+  crossing(type = c("Frequentist", "Bayesian")
+         , method = c("2a_ipd_dc", "2b_ipd_mlm", "3_ipd_meta")) %>%
+  mutate(dir = ifelse(method != "3_ipd_meta", "predicted", "studyPredicted")
+         , file = pmap(list(method, type, dir, local_path), ~list.files(sprintf("%s/results/%s/%s/%s", ..4, ..1, ..2, ..3)))) %>%
+  unnest(file) %>%
+  # filter(method == "3_ipd_meta") %>%
+  mutate(pred.rx = pmap(list(file, type, method, "pred.rx", dir), loadRData)) %>%
+  separate(file, c("Outcome", "Trait", "Moderator", "Covariate", "study"), sep = "_") %>%
+    mutate(study = str_remove_all(study, ".RData")
+           , Covariate = str_remove_all(Covariate, ".RData")) %>%
+  filter(!Moderator %in% stdyModers$short_name & Moderator != "SRhealth") %>%
+  mutate(pred.rx = ifelse(!is.na(study), map2(pred.rx, study, ~(.x) %>% mutate(study = .y)), pred.rx)) %>%
+  select(-study,  -dir) 
+```
+
+```{r}
+pred_rx_prep_fun <- function(d, mod){
+  d <- d %>% unclass %>% data.frame
+  d$mod_value <- d[,mod]
+  d <- d %>% select(-all_of(mod)) %>% as_tibble
+  if(class(d$mod_value) %in% c("factor", "character")){
+    d <- d %>% mutate(mod_fac = factor(mod_value))
+  } else{
+    d2 <- d %>% 
+        select(study, mod_value) %>% 
+        distinct() %>% 
+        arrange(study, mod_value)
+    if(mod == "age") d2 <- d2 %>% mutate(mod_fac = factor(mod_value, levels = c(-10, 0, 10), labels = c("-10 yrs", "M", "+10 yrs")))
+    else if(mod == "baseYear") d2 <- d2 %>% mutate(mod_fac = factor(mod_value, levels = c(-10, 0, 10), labels = c("1990", "200)0", "2010")))
+    else if(mod == "baseAge") d2 <- d2 %>% mutate(mod_fac = factor(mod_value, levels = c(-10, 0, 10), labels = c("50", "60", "70")))
+    else if(mod == "predInt") d2 <- d2 %>% mutate(mod_fac = factor(mod_value, levels = c(-5, 0, 5), labels = c("-5 yrs", "5 yrs", "+5 yrs")))
+    else if(mod == "education") d2 <- d2 %>% mutate(mod_fac = factor(mod_value, levels = c(-5, 0, 5), labels = c("-5 yrs", "12 years", "+5 yrs")))
+    else d2 <- d2 %>% mutate(mod_fac = factor(mod_value, levels = unique(mod_value), labels = c("-1 SD", "M", "+1 SD")))
+    d <- d %>% full_join(d2) %>% ungroup()
+  }
+  d %>% 
+    group_by(study, mod_fac, p_value) %>% 
+    summarize_at(vars(one_of(c("pred", "lower", "upper"))), mean) %>%
+    ungroup() 
+}
+
+nested_simp_rx <- nested_simp_rx %>%
+  unnest(pred.rx) %>%
+  group_by(type, Outcome, Trait, Moderator, Covariate) %>%
+  nest(pred.rx = p_value:upper) %>%
+  ungroup() %>%
+  mutate(pred.rx = map2(pred.rx, Moderator, pred_rx_prep_fun))
+```
+
+```{r}
+ipd_std_se_plot_fun <- function(df, outcome, trait, mod, cov, type){
+  print(paste(outcome, mod))
+  o <- mapvalues(outcome, outcomes$short_name, outcomes$long_name, warn_missing = F)
+  trt <- mapvalues(trait, traits$short_name, traits$long_name, warn_missing = F)
+  cv <- mapvalues(cov, covars$short_name, covars$long_name, warn_missing = F)
+  m <- mapvalues(mod, moders$short_name, moders$long_name, warn_missing = F)
+  d <- round(max(abs(min(df$pred)), abs(max(df$pred))), 3)
+  titl <- if(mod == "none"){sprintf("%s: %s", o, trt)} else {sprintf("%s: %s x %s Simple Effects", o, trt, m)}
+  std <- unique(df$study)
+  cols <- (stdcolors %>% filter(studies %in% std))$colors
+  lt <- (stdcolors %>% filter(studies %in% std))$lt
+  ht <- length(unique(df$mod_fac))
+  mini <- if(min(df$pred) > 0) floor(min(df$pred)) else 0; maxi <- 10
+  p <- df %>%
+    filter(!is.na(study)) %>%
+    mutate(study = factor(study, levels = stdcolors$studies),
+           method = mapvalues(method, mthds$old_name, str_wrap(mthds$long_name, 25), warn_missing = F),
+           # lower = ifelse(lower < 4, 4, lower),
+           # upper = ifelse(upper > 10, 10, upper),
+           gr = ifelse(study == "Overall", "Overall", "study")) %>%
+    group_by(study, mod_fac, p_value, gr, method) %>%
+    summarize_at(vars(pred, lower, upper), mean) %>%
+    ungroup() %>%
+    ggplot(aes(x = p_value
+               , y = pred
+               , group  = study))  +
+      scale_y_continuous(limits = c(mini,maxi)
+                         , breaks = seq(mini, maxi, by = 2)
+                         , labels = seq(mini, maxi, by = 2)) +
+      scale_linetype_manual(values = lt) +
+      scale_color_manual(values = cols) +
+      scale_fill_manual(values = cols) +
+      scale_size_manual(values = c(2,.8)) + 
+      geom_line(aes(linetype = study, color = study, size = gr)) +
+      labs(x = "Personality (POMP)"
+           , y = paste(o, "(POMP)")
+           , title = titl
+           , linetype = "Study"
+           , color = "Study"
+           , fill = "Study"
+           # , subtitle = "Method 2B: Pooled Regression Using Random Effects"
+           ) +
+      guides(size = "none") +
+      facet_grid(mod_fac ~ method, scales = "free") +
+      theme_classic() +
+      theme(legend.position = "bottom"
+            , plot.title = element_text(face = "bold", size = rel(1.2), hjust = .5)
+            # , plot.subtitle = element_text(size = rel(1.1), hjust = .5)
+            , strip.background = element_rect(fill = "black", color = "black")
+            , panel.background = element_rect(color = "black")
+            , strip.text = element_text(face = "bold", color = "white")
+            , axis.text = element_text(color = "black"))
+  ggsave(p, file = sprintf("%s/results/figures/cross-method/study specific simple effects/%s_%s_%s_%s_%s.png", local_path, type, outcome, trt, mod, cov), width = 8, height = 3*ht)
+  ggsave(p, file = sprintf("%s/results/figures/cross-method/study specific simple effects/%s_%s_%s_%s_%s.pdf", local_path, type, outcome, trt, mod, cov), width = 8, height = 3*ht)
+  return(p)
+}
+
+nested_simp_fx %>%
+  select(-contains("dir")) %>%
+  right_join(nested_simp_rx %>% 
+               mutate(pred.rx = map(pred.rx
+               , ~(.) %>% mutate(study = mapvalues(
+                 study, c("OCTOTWIN", "BASEI")
+                 , c("OCTO-TWIN", "BASE-I")
+                 , warn_missing = F))
+             ))) %>%
+  filter(!map_lgl(pred.fx, is.null)) %>%
+  mutate(pred.comb = map2(pred.fx, pred.rx, ~(.x) %>% mutate(study = "Overall") %>% full_join(.y))) %>%
+  select(-pred.fx, -pred.rx) %>%
+  group_by(type, Outcome, Trait, Moderator, Covariate) %>%
+  nest() %>%
+  ungroup() %>%
+  # filter(type == "Frequentist" & Moderator == "gender" & Trait == "E") %>%
+  mutate(data = map(data, ~(.) %>% unnest(pred.comb))
+         , pmap(list(data, Outcome, Trait, Moderator, Covariate, type), ipd_std_se_plot_fun))
+```
+
+## Comparisons Across Methods: Bayesian versus Frequentist  
+
+### Tables  
+#### Fixed Effects  
+```{r}
+## table function 
+ipd_comp_fx_tab_fun <- function(d, moder, covar){
+  print(moder)
+  md <- mapvalues(moder, c(moders$long_name, stdyModers$long_name), c(moders$short_name, stdyModers$short_name), warn_missing = F)
+  cv <- mapvalues(covar, covars$long_name, covars$short_name)
+  rs <- d %>% mutate(method = factor(method, levels = mthds$old_name, labels = mthds$long_name)) %>% group_by(method) %>% tally() %>% 
+    mutate(end = cumsum(n), start = lag(end) + 1, start = ifelse(is.na(start), 1, start))
+  cs <- if(length(unique(d$term)) == 1) c(1, rep(2,5)) else rep(2,6)
+  names(cs) <- c(" ", traits$short_name)
+  cln <- if(length(unique(d$term)) == 1) c(" ", rep(c("<em>b</em>", "CI"), times = 5)) else c(" ", "Term", rep(c("<em>b</em>", "[CI]"), times = 5))
+  al <- if(length(unique(d$term))) c("r", rep("c", 10)) else c("r", "r", rep("c", 10))
+  if(length(unique(d$term)) == 1) {
+    d <- d %>% select(-term)
+  } 
+  cap <- if(md == "none") "Comparison of Bayesian and Frequentist Approaches to Overall Effects of Personality-Crystallized Domain Associations" else sprintf("Comparison of Bayesian and Frequentist Approaches to Overall %s Moderation of Personality-Crystallized Domain Associations", md)
+  tab <- d %>%
+    select(-method) %>%
+    kable(., "html"
+          , escape = F
+          , col.names = cln
+          , align = al
+          , caption = cap
+    ) %>% 
+    kable_classic(full_width = F, html_font = "Times New Roman") %>%
+    add_header_above(cs) %>%
+    collapse_rows(1, valign = "top", row_group_label_position = "stack")
+  for (i in 1:nrow(rs)) {
+    tab <- tab %>% kableExtra::group_rows(rs$method[i], rs$start[i], rs$end[i])
+  }
+  # if(dubs == T) for(i in 1:nrow(rs2)) {
+  #   tab <- tab %>% kableExtra::group_rows(rs2$method[i], rs2$start[i], rs2$end[i]
+  #                                         , indent = T, hline_after = F)
+  # }
+  save_kable(tab, file = sprintf("%s/results/tables/bayes-v-freq/overall/%s_%s.html"
+                                 , local_path, md, cv))
+  return(tab)
+}
+
+nested_comp_fx_tab <- ipd_fx_tab %>% 
+  group_by(Moderator, Covariate, Outcome) %>%
+  arrange(method, type) %>%
+  nest() %>%
+  ungroup() %>%
+  mutate(tab = pmap(list(data, Moderator, Covariate), ipd_comp_fx_tab_fun))
+```
+
+#### Study-Specific  
+```{r}
+ipd_rx_comp_tab_fun <- function(d, moder, covar){
+  print(moder)
+  md <- mapvalues(moder, c(moders$long_name, stdyModers$long_name), c(moders$short_name, stdyModers$short_name), warn_missing = F)
+  cv <- mapvalues(covar, covars$long_name, covars$short_name)
+  rs <- d %>% mutate(method = factor(method, levels = mthds$old_name, labels = mthds$long_name)) %>% group_by(method) %>% tally() %>% 
+    mutate(end = cumsum(n), start = lag(end) + 1, start = ifelse(is.na(start), 1, start))
+  cs <- if(length(unique(d$term)) == 1) rep(2,6) else c(3, rep(2,5))
+  names(cs) <- c(" ", traits$short_name)
+  cln <- if(length(unique(d$term)) == 1) c(" ", "Study", rep(c("<em>b</em>", "CI"), times = 5)) else c(" ", "Study", "Term", rep(c("<em>b</em>", "[CI]"), times = 5))
+  al <- if(length(unique(d$term))) c("r", "r", rep("c", 10)) else c("r", "r", "r", rep("c", 10))
+  if(length(unique(d$term)) == 1) {
+    d <- d %>% select(-term); dubs <- F
+  } #else {
+  #   rs2 <- d %>% group_by(Covariate, method) %>% tally() %>% 
+  #   mutate(end = cumsum(n), start = lag(end) + 1, start = ifelse(is.na(start), 1, start))
+  #   d <- d %>% select(-method); dubs <- T
+  # }
+  # caption 
+  cap <- if(md == "none") "Comparison of Bayesian and Frequentist Approaches to Personality-Crystallized Domain Associations" else sprintf("Comparison of Bayesian and Frequentist Approaches to Study-Specific %s Moderation of Personality-Crystallized Domain Associations", md)
+  tab <- d %>%
+    select(study, type, everything(), -method) %>%
+    kable(., "html"
+          , escape = F
+          , booktabs = T
+          , col.names = cln
+          , align = al
+          , caption = cap
+    ) %>% 
+    kable_classic(full_width = F, html_font = "Times New Roman") %>%
+    add_header_above(cs) %>% 
+    collapse_rows(1:2, valign = "top", row_group_label_position = "stack")
+  for (i in 1:nrow(rs)) {
+    tab <- tab %>% kableExtra::group_rows(rs$method[i], rs$start[i], rs$end[i])
+  }
+  # if(dubs == T) for(i in 1:nrow(rs2)) {
+  #   tab <- tab %>% kableExtra::group_rows(rs2$method[i], rs2$start[i], rs2$end[i]
+  #                                         , indent = T, hline_after = F)
+  # }
+  save_kable(tab, file = sprintf("%s/results/tables/bayes-v-freq/study-specific/%s_%s.html"
+                                 , local_path, md, cv, md))
+  return(tab)
+}
+
+nested_comp_fx_tab <- ipd_rx_tab %>% 
+  mutate(study = mapvalues(study, c("BASEI", "OCTOTWIN"), c("BASE-I", "OCTO-TWIN"))) %>%
+  group_by(Moderator, Covariate, Outcome) %>%
+  arrange(method, study, type) %>%
+  nest() %>%
+  ungroup() %>%
+  mutate(tab = pmap(list(data, Moderator, Covariate), ipd_rx_comp_tab_fun))
+```
+
+### Figures  
+#### Fixed Effects  
+```{r}
+fx_forest_fun <- function(d, mod, type, cov){
+  print(paste(mod, cov))
+  m <- mapvalues(mod, moders$long_name, moders$short_name, warn_missing = F)
+  cv <- mapvalues(cov, covars$long_name, covars$short_name, warn_missing = F)
+  d <- d %>% filter(!is.na(estimate))
+  dl <- round(max(abs(min(d$estimate)), abs(max(d$estimate))), 3)
+  dig <- if(dl < .01) 3 else 2
+  lim <- if(mod == "none"){c(-.25, .25)} else{c(round_any(0-dl-(dl/2.5), .001, floor), round_any(0+dl+(dl/2.5), .001, ceiling))}
+  brk <- if(mod == "none"){seq(-.2,.2,.2)} else{round(c(0-dl-(dl/5), 0, 0+dl+(dl/5)),3)}
+  lab <- if(mod == "none"){c("-.2", "0", ".2")} else{round(c(0-dl-(dl/5), 0, 0+dl+(dl/5)),dig)}
+  shapes <- c(15, 16)[1:length(unique(d$term))]
+  lt <- rep("solid", length(unique(d$term)))
+  titl <- if(m == "none"){NULL} else {sprintf("%s Moderation of Personality-Outcome Associations", mod)}
+  titl <- if(!cv %in% c("none", "all")) paste(cov, "Adjusted", titl, collapse = " ") else paste(cov, titl, collapse = " ")
+  leg <- if(length(unique(d$term)) > 1){"bottom"} else {"none"}
+  p <- d %>%
+    mutate(conf.low = ifelse(conf.low < lim[1], lim[1], conf.low),
+           conf.high = ifelse(conf.high > lim[2], lim[2], conf.high)) %>% 
+  ggplot(aes(x = method, y = estimate)) +
+    scale_y_continuous(limits = lim, breaks = brk, labels = lab) + 
+    scale_size_manual(values = c(1.3, .85)) +
+    scale_shape_manual(values = shapes) +
+    scale_color_manual(values = c("blue", "black")) +
+    scale_linetype_manual(values = lt) +
+    geom_hline(aes(yintercept = 0), size = .25, color = "gray50") +
+    geom_errorbar(aes(ymin = conf.low, ymax = conf.high, linetype = term)
+                  , width = 0
+                  , position = position_dodge(width = .9)) + 
+    geom_point(aes(color = sig, size = sig, shape = term)
+                  , position = position_dodge(width = .9)) +
+    labs(x = NULL, y = "Estimate (POMP)", title = titl) +
+    facet_grid(Outcome~Trait, scales = "free_y", space = "free") +
+    coord_flip() +
+    theme_classic() +
+    theme(legend.position = leg,
+          plot.title = element_text(face = "bold", size = rel(1.2), hjust = .5),
+          panel.background = element_rect(color = "black", fill = "white"),
+          strip.background = element_blank(),
+          strip.text = element_text(face = "bold", color = "black", size = rel(1.4)),
+          axis.text = element_text(color = "black"),
+          axis.text.y = element_text(size = rel(1)))
+  ht <- length(unique(d$Outcome))
+  wdt <- length(unique(d$Trait))
+  ggsave(file = sprintf("%s/results/figures/bayes-v-freq/overall forest/%s_%s_%s_fixed.png", wd, type, mod, cv), width = wdt*2, height = ht*3)
+  gc()
+  return(p)
+}
+
+nested_ipd_fx_fig <-
+  nested_ipd_fx %>%
+  unnest(fx) %>%
+  filter((Moderator == "none" & term == "p_value") |
+         (Moderator != "none" & grepl("p_value:", term)
+          & !grepl("p_value:study", term)
+          & !(grepl("cor_", term) | grepl("sd_", term)))) %>%
+  # filter(!Moderator %in% unique(stdyModers$short_name)) %>%
+  filter(!Moderator %in% c("scale", "continent", "country")) %>%
+  mutate(sig = ifelse(sign(conf.low) == sign(conf.high), "sig", "ns"),
+         Outcome = factor(Outcome, outcomes$short_name, outcomes$long_name),
+         Covariate = factor(Covariate, covars$short_name, str_wrap(covars$long_name, 15)),
+         term = str_remove_all(term, "p_value:"),
+         term = ifelse(term == "gender", "genderFemale", term),
+         term = str_replace(term, "metamod", Moderator),
+         term = factor(term, c(covars$short_term, moders$short_term, stdyModers$short_term),
+                       c(covars$long_term, moders$long_term, stdyModers$long_term)),
+         Moderator = factor(Moderator, c(moders$short_name, stdyModers$short_name)
+                            , c(moders$long_name, stdyModers$long_name))) %>%
+  group_by(type, Moderator, Covariate) %>%
+  nest() %>%
+  ungroup() %>%
+  # filter(Moderator == "Gender") %>%
+  mutate(p = pmap(list(data, Moderator, type, Covariate), fx_forest_fun))
+```
+
+#### Study-Specific Effects  
+```{r}
+rx_forest_fun <- function(d, mod, type, cov, out){
+  print(paste(mod, cov))
+  m <- mapvalues(mod, moders$long_name, moders$short_name, warn_missing = F)
+  cv <- mapvalues(cov, covars$long_name, covars$short_name, warn_missing = F)
+  d <- d %>% filter(!is.na(estimate))
+  dl <- round(max(abs(min(d$estimate)), abs(max(d$estimate))), 3)
+  lim <- if(mod == "none"){c(-.25, .25)} else{c(0-dl-(dl/2.5), 0+dl+(dl/2.5))}
+  brk <- if(mod == "none"){seq(-.2,.2,.2)} else{round(c(0-dl-(dl/5), 0, 0+dl+(dl/5)),2)}
+  lab <- if(mod == "none"){c("-.2", "0", ".2")} else{str_remove(round(c(0-dl-(dl/5), 0, 0+dl+(dl/5)),2), "^0")}
+  shapes <- c(15, 16)[1:length(unique(d$term))]
+  lt <- rep("solid", length(unique(d$term)))
+  titl <- if(m == "none"){NULL} else {sprintf("%s Moderation of Personality-Outcome Associations", mod)}
+  titl <- if(!cv %in% c("none", "all")) paste(cov, "Adjusted", titl, collapse = " ") else paste(cov, titl, collapse = " ")
+  leg <- if(length(unique(d$term)) > 1){"bottom"} else {"none"}
+  p <- d %>%
+    mutate(conf.low = ifelse(conf.low < lim[1], lim[1], conf.low),
+           conf.high = ifelse(conf.high > lim[2], lim[2], conf.high),
+           Trait = factor(Trait, levels = traits$short_name)) %>% 
+  ggplot(aes(x = method, y = estimate)) +
+    scale_y_continuous(limits = lim, breaks = brk, labels = lab) + 
+    scale_size_manual(values = c(.85, 1.3)) +
+    scale_shape_manual(values = shapes) +
+    scale_color_manual(values = c("black", "blue")) +
+    scale_linetype_manual(values = lt) +
+    geom_hline(aes(yintercept = 0), size = .25, color = "gray50") +
+    geom_errorbar(aes(ymin = conf.low, ymax = conf.high, linetype = term)
+                  , width = 0
+                  , position = position_dodge(width = .9)) + 
+    geom_point(aes(color = sig, size = sig, shape = term)
+                  , position = position_dodge(width = .9)) +
+    labs(x = NULL, y = "Estimate (POMP)", title = titl) +
+    facet_grid(Trait~study, scales = "free_y", space = "free") +
+    coord_flip() +
+    theme_classic() +
+    theme(legend.position = leg,
+          plot.title = element_text(face = "bold", size = rel(1.2), hjust = .5),
+          panel.background = element_rect(color = "black", fill = "white"),
+          strip.background = element_blank(),
+          strip.text.y = element_text(face = "bold", color = "black", size = rel(1.4)),
+          strip.text.x = element_text(face = "bold", color = "black", size = rel(1.3)),
+          axis.text = element_text(color = "black"),
+          axis.text.y = element_text(size = rel(1)))
+  ht <- length(unique(d$Trait))
+  wdt <- length(unique(d$study))
+  ggsave(file = sprintf("%s/results/figures/bayes-v-freq/study-specific/%s_%s_%s_%s_fixed.png", wd, type, out, mod, cv), width = wdt*1.5, height = ht*2)
+  gc()
+  return(p)
+}
+
+nested_ipd_rx_fig <- nested_ipd_rx %>% 
+  unnest(rx) %>%
+  mutate(term = ifelse(is.na(term), names, term)) %>%
+  filter((Moderator == "none" & term == "p_value") |
+         (Moderator != "none" & grepl("p_value:", term))) %>%
+  mutate(sig = ifelse(sign(conf.low) == sign(conf.high), "sig", "ns"),
+         Outcome = factor(Outcome, outcomes$short_name, outcomes$long_name),
+         Covariate = factor(Covariate, covars$short_name, str_wrap(covars$long_name, 15)),
+         term = str_remove_all(term, "p_value:"),
+         term = ifelse(term == "gender", "genderFemale", term),
+         term = factor(term, c(covars$short_term, moders$short_term, stdyModers$short_term),
+                       c(covars$long_term, moders$long_term, stdyModers$long_term)),
+         Moderator = factor(Moderator, c(moders$short_name, stdyModers$short_name)
+                            , c(moders$long_name, stdyModers$long_name)),
+         study = mapvalues(study, c("BASEI", "OCTOTWIN"), c("BASE-I", "OCTO-TWIN"))) %>%
+  group_by(type, Moderator, Covariate, Outcome) %>% 
+  nest() %>%
+  ungroup() %>%
+  mutate(p = pmap(list(data, Moderator, type, Covariate, Outcome), rx_forest_fun))
+```
